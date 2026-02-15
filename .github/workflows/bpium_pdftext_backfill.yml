@@ -46,6 +46,33 @@ jobs:
         with:
           python-version: "3.13"
 
+      - name: Preflight (secrets/inputs)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=()
+          [[ -z "${BPIUM_DOMAIN:-}" ]] && missing+=("BPIUM_DOMAIN")
+          [[ -z "${BPIUM_LOGIN:-}" ]] && missing+=("BPIUM_LOGIN")
+          [[ -z "${BPIUM_PASSWORD:-}" ]] && missing+=("BPIUM_PASSWORD")
+          [[ -z "${PARSER_API_KEY:-}" ]] && missing+=("PARSER_API_KEY")
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "::error title=Missing GitHub Secrets::${missing[*]}"
+            exit 1
+          fi
+
+          if [[ "${BPIUM_DOMAIN}" != http*://* ]]; then
+            echo "::error title=Invalid BPIUM_DOMAIN::Expected full base URL like https://mtkkidney.bpium.ru (got '${BPIUM_DOMAIN}')"
+            exit 1
+          fi
+
+          RID="${{ github.event.inputs.record_id }}"
+          if [[ -z "${RID}" ]]; then
+            echo "::error title=Missing input::record_id is empty"
+            exit 1
+          fi
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -65,4 +92,3 @@ jobs:
           if [ "$DRY" = "true" ]; then ARGS+=(--dry-run); fi
 
           python bpium_pdftext_worker.py "${ARGS[@]}"
-
