@@ -561,9 +561,13 @@ def main() -> int:
         if args.track_record_id:
             track_records = [bpium_get_record(s, domain, headers, cat_44, str(args.track_record_id))]
         else:
+            # Fair selection: pick records that were synced least recently (LastReqAt/LastSyncAt),
+            # not the newest record by id. This prevents "new INN starvation" when max_tracks_per_run=1.
+            candidates: List[Dict[str, Any]] = []
             offset = 0
             page_size = 200
-            while len(track_records) < int(args.max_tracks_per_run):
+            max_scan = 5000
+            while tracks_scanned < max_scan:
                 page = bpium_list_records(
                     s,
                     domain,
@@ -573,7 +577,16 @@ def main() -> int:
                     offset=offset,
                     sort_field="id",
                     sort_type="-1",
-                    fields_json=json.dumps([f44_inn, f44_sync_enabled, f44_last_req_log, f44_search_from]),
+                    fields_json=json.dumps(
+                        [
+                            f44_inn,
+                            f44_sync_enabled,
+                            f44_last_req_log,
+                            f44_search_from,
+                            f44_last_req_at,
+                            f44_last_sync_at,
+                        ]
+                    ),
                 )
                 if not page:
                     break
@@ -585,10 +598,25 @@ def main() -> int:
                     inn = digits_only(str(get_value(vals, f44_inn) or ""))
                     if len(inn) not in (10, 12):
                         continue
-                    track_records.append(rec)
-                    if len(track_records) >= int(args.max_tracks_per_run):
-                        break
+                    candidates.append(rec)
                 offset += page_size
+
+            def track_sort_key(rec: Dict[str, Any]) -> Tuple[str, int]:
+                vals = as_dict(rec.get("values"))
+                # Prefer LastReqAt; fallback to LastSyncAt; then by id.
+                dt = parse_iso_utc(str(get_value(vals, f44_last_req_at) or "")) or parse_iso_utc(
+                    str(get_value(vals, f44_last_sync_at) or "")
+                )
+                # Use a stable string key to avoid naive datetime comparisons if parsing fails.
+                dt_key = dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt is not None else "1970-01-01T00:00:00Z"
+                try:
+                    rid = int(str(rec.get("id") or "0"))
+                except Exception:
+                    rid = 0
+                return (dt_key, rid)
+
+            candidates.sort(key=track_sort_key)
+            track_records = candidates[: int(args.max_tracks_per_run)]
 
         out_summary["tracks"]["scanned"] = tracks_scanned
 
