@@ -1,15 +1,32 @@
-name: Bpium PdfText Backfill (Single Record)
+name: Bpium PdfText Backfill
 
 on:
   workflow_dispatch:
     inputs:
       record_id:
-        description: "Bpium record id to process (catalog 45 by default)"
-        required: true
+        description: "Bpium record id to process (optional). Leave empty to scan catalog and fill empty PdfText."
+        required: false
+        default: ""
       budget:
         description: "Max parser-api calls per run"
         required: true
-        default: "1"
+        default: "10"
+      page_size:
+        description: "Bpium page size when scanning"
+        required: true
+        default: "100"
+      max_scan:
+        description: "Max Bpium records to scan per run"
+        required: true
+        default: "2000"
+      retry_errors:
+        description: "Retry records with PdfTextStatus=error (true/false)"
+        required: true
+        default: "true"
+      cooldown_hours:
+        description: "Skip recently-attempted records unless --force (hours)"
+        required: true
+        default: "24"
       force:
         description: "Process even if PdfText already exists (true/false)"
         required: true
@@ -19,10 +36,17 @@ on:
         required: true
         default: "false"
 
+  schedule:
+    # Automatic backfill in small batches to protect parser-api limits.
+    - cron: "17 * * * *"
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    concurrency:
+      group: bpium-pdftext-backfill
+      cancel-in-progress: false
     env:
       BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
       BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
@@ -67,12 +91,6 @@ jobs:
             exit 1
           fi
 
-          RID="${{ github.event.inputs.record_id }}"
-          if [[ -z "${RID}" ]]; then
-            echo "::error title=Missing input::record_id is empty"
-            exit 1
-          fi
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -82,13 +100,32 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # For schedule runs, inputs.* will be empty; use safe defaults.
           RID="${{ github.event.inputs.record_id }}"
           BUDGET="${{ github.event.inputs.budget }}"
+          PAGE_SIZE="${{ github.event.inputs.page_size }}"
+          MAX_SCAN="${{ github.event.inputs.max_scan }}"
+          RETRY_ERRORS="${{ github.event.inputs.retry_errors }}"
+          COOLDOWN_HOURS="${{ github.event.inputs.cooldown_hours }}"
           FORCE="${{ github.event.inputs.force }}"
           DRY="${{ github.event.inputs.dry_run }}"
 
-          ARGS=(--record-id "$RID" --budget "$BUDGET")
-          if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
-          if [ "$DRY" = "true" ]; then ARGS+=(--dry-run); fi
+          # Schedule defaults (small batch).
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            RID=""
+            BUDGET="10"
+            PAGE_SIZE="100"
+            MAX_SCAN="2000"
+            RETRY_ERRORS="true"
+            COOLDOWN_HOURS="24"
+            FORCE="false"
+            DRY="false"
+          fi
+
+          ARGS=(--budget "$BUDGET" --page-size "$PAGE_SIZE" --max-scan "$MAX_SCAN" --cooldown-hours "$COOLDOWN_HOURS")
+          if [[ -n "${RID}" ]]; then ARGS+=(--record-id "$RID"); fi
+          if [[ "${RETRY_ERRORS}" == "true" ]]; then ARGS+=(--retry-errors); fi
+          if [[ "${FORCE}" == "true" ]]; then ARGS+=(--force); fi
+          if [[ "${DRY}" == "true" ]]; then ARGS+=(--dry-run); fi
 
           python bpium_pdftext_worker.py "${ARGS[@]}"

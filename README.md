@@ -27,11 +27,15 @@ Optional (only if your field IDs differ from defaults):
 - `BPIUM_FIELD_PDF_TEXT_ERROR` (default: `22`)
 
 ## 2) Run
-GitHub -> `Actions` -> `Bpium PdfText Backfill (Single Record)` -> `Run workflow`
+GitHub -> `Actions` -> `Bpium PdfText Backfill` -> `Run workflow`
 
 Inputs:
-- `record_id` (required) - Bpium record id to process
-- `budget` (default: 1) - max parser-api calls (keep small to protect tokens)
+- `record_id` (optional) - if empty, the worker scans the catalog and fills records with empty `PdfText`
+- `budget` (default: 10) - max parser-api calls (keep small to protect tokens)
+- `page_size` (default: 100) - Bpium page size for scanning
+- `max_scan` (default: 2000) - max records to scan per run
+- `retry_errors` (default: true) - retry records with `PdfTextStatus=error` (with cooldown)
+- `cooldown_hours` (default: 24) - skip recently-attempted records unless `force=true`
 - `force` (default: false) - write even if `PdfText` already exists
 - `dry_run` (default: false) - do not write back to Bpium
 
@@ -39,3 +43,5 @@ Inputs:
 - The worker does NOT depend on Java/PDFBox in Bpium. It extracts text with `pypdf`.
 - It is safe to keep this repo public if you never commit secrets into the code.
 
+## 4) Automatic mode
+The workflow has an hourly schedule (`cron`) and will process a small batch each run (default budget: 10).

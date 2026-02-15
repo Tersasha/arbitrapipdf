@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from pypdf import PdfReader
@@ -19,6 +19,20 @@ def iso_utc_now() -> str:
 def build_auth_header(login: str, password: str) -> str:
     token = f"{login}:{password}".encode("utf-8")
     return "Basic " + base64.b64encode(token).decode("ascii")
+
+
+def parse_iso_utc(s: str) -> Optional[datetime]:
+    ss = str(s or "").strip()
+    if not ss:
+        return None
+    # Expect our own format: 2026-02-15T12:34:56Z
+    try:
+        if ss.endswith("Z"):
+            return datetime.strptime(ss, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        # Fallback: try to parse timezone-aware ISO (best-effort)
+        return datetime.fromisoformat(ss.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def request_json(
@@ -120,6 +134,32 @@ def extract_text_from_pdf_base64(b64: str) -> Tuple[str, str]:
     return "ok", text
 
 
+def get_value(values: Dict[str, Any], field_id: str) -> Any:
+    if field_id in values:
+        return values[field_id]
+    try:
+        i = int(field_id)
+    except Exception:
+        return None
+    return values.get(i)
+
+
+def list_records(
+    session: requests.Session,
+    base_url: str,
+    headers: Dict[str, str],
+    catalog_id: str,
+    *,
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    url = f"{base_url}/api/v1/catalogs/{catalog_id}/records"
+    data = request_json(session, "GET", url, headers=headers, params={"limit": str(limit), "offset": str(offset)})
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected records list type: {type(data)}")
+    return [x for x in data if isinstance(x, dict)]
+
+
 def get_record(
     session: requests.Session,
     base_url: str,
@@ -147,20 +187,23 @@ def patch_record_values(
     return request_json(session, "PATCH", url, headers=headers, json_body=payload, timeout=60)
 
 
-def get_value(values: Dict[str, Any], field_id: str) -> Any:
-    if field_id in values:
-        return values[field_id]
-    try:
-        i = int(field_id)
-    except Exception:
-        return None
-    return values.get(i)
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Bpium worker: fill PdfText for one record using parser-api /pdf_download")
-    ap.add_argument("--record-id", required=True, help="Bpium record id to process")
-    ap.add_argument("--budget", type=int, default=1, help="Max parser-api calls (default 1)")
+    ap = argparse.ArgumentParser(description="Bpium worker: fill PdfText using parser-api /pdf_download")
+    ap.add_argument("--record-id", default="", help="Bpium record id to process (if empty, scan catalog)")
+    ap.add_argument("--budget", type=int, default=1, help="Max parser-api calls per run (default 1)")
+    ap.add_argument("--page-size", type=int, default=100, help="How many Bpium records to fetch per page (default 100)")
+    ap.add_argument("--max-scan", type=int, default=2000, help="Max records to scan per run (default 2000)")
+    ap.add_argument(
+        "--retry-errors",
+        action="store_true",
+        help="Also retry records with PdfTextStatus=error (with cooldown). Default: false",
+    )
+    ap.add_argument(
+        "--cooldown-hours",
+        type=int,
+        default=24,
+        help="Do not reprocess recently attempted records unless --force (default 24h)",
+    )
     ap.add_argument("--force", action="store_true", help="Write even if PdfText already exists")
     ap.add_argument("--dry-run", action="store_true", help="Do not write to Bpium")
     args = ap.parse_args()
@@ -190,63 +233,126 @@ def main() -> int:
     }
 
     with requests.Session() as s:
-        rec = get_record(s, domain, headers, catalog_id, str(args.record_id))
-        vals = rec.get("values") if isinstance(rec.get("values"), dict) else {}
+        api_calls = 0
+        scanned = 0
+        processed = 0
+        ok_count = 0
+        empty_count = 0
+        error_count = 0
 
-        pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
-        if not pdf_url:
-            print(json.dumps({"ok": False, "reason": "no_pdf_url"}, ensure_ascii=False))
-            return 0
+        def should_process(vals: Dict[str, Any]) -> Tuple[bool, str]:
+            pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
+            if not pdf_url:
+                return False, "no_pdf_url"
 
-        existing = str(get_value(vals, fid_pdf_text) or "")
-        if existing.strip() and not args.force:
-            print(json.dumps({"ok": True, "skipped": True, "reason": "already_has_pdftext"}, ensure_ascii=False))
-            return 0
+            existing = str(get_value(vals, fid_pdf_text) or "").strip()
+            if existing and not args.force:
+                return False, "already_has_pdftext"
 
-        if args.budget < 1:
-            print(json.dumps({"ok": False, "reason": "budget_lt_1"}, ensure_ascii=False))
-            return 0
+            status = str(get_value(vals, fid_pdf_text_status) or "").strip().lower()
+            fetched_at = parse_iso_utc(str(get_value(vals, fid_pdf_text_fetched_at) or ""))
 
-        try:
-            b64 = parser_api_pdf_download(s, api_key, pdf_url)
-            if not b64:
-                status, payload = "empty", ""
+            # Default behavior: only fill when PdfText is empty and status is not a known terminal state.
+            if not args.force:
+                if status == "ok":
+                    return False, "status_ok"
+                if status == "empty":
+                    return False, "status_empty"
+                if status == "error" and not args.retry_errors:
+                    return False, "status_error_skip"
+
+                if fetched_at is not None and args.cooldown_hours > 0:
+                    age_h = (datetime.now(timezone.utc) - fetched_at).total_seconds() / 3600.0
+                    if age_h < float(args.cooldown_hours):
+                        return False, "cooldown"
+
+            return True, "need_process"
+
+        def process_record(record_id: str, vals: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal api_calls, processed, ok_count, empty_count, error_count
+
+            pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
+
+            if args.budget < 1:
+                return {"ok": False, "reason": "budget_lt_1"}
+            if api_calls >= args.budget:
+                return {"ok": True, "skipped": True, "reason": "budget_exhausted"}
+
+            processed += 1
+            api_calls += 1
+
+            try:
+                b64 = parser_api_pdf_download(s, api_key, pdf_url)
+                if not b64:
+                    status, payload = "empty", ""
+                else:
+                    status, payload = extract_text_from_pdf_base64(b64)
+            except Exception as exc:
+                status, payload = "error", str(exc)
+
+            if status == "ok":
+                ok_count += 1
+            elif status == "empty":
+                empty_count += 1
             else:
-                status, payload = extract_text_from_pdf_base64(b64)
-        except Exception as exc:
-            status, payload = "error", str(exc)
+                error_count += 1
 
-        now = iso_utc_now()
-        out_vals: Dict[str, Any] = {
-            str(fid_pdf_text_status): status,
-            str(fid_pdf_text_fetched_at): now,
-            str(fid_pdf_text_error): payload if status == "error" else "",
-            str(fid_pdf_text): payload if status == "ok" else "",
-        }
+            now = iso_utc_now()
+            out_vals: Dict[str, Any] = {
+                str(fid_pdf_text_status): status,
+                str(fid_pdf_text_fetched_at): now,
+                str(fid_pdf_text_error): payload if status == "error" else "",
+                str(fid_pdf_text): payload if status == "ok" else "",
+            }
 
-        if args.dry_run:
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "dryRun": True,
-                        "status": status,
-                        "textLen": len(payload) if status == "ok" else 0,
-                        "error": payload if status == "error" else "",
-                    },
-                    ensure_ascii=False,
-                )
-            )
+            if not args.dry_run:
+                patch_record_values(s, domain, headers, catalog_id, str(record_id), out_vals)
+
+            return {"ok": True, "recordId": str(record_id), "status": status, "textLen": len(payload) if status == "ok" else 0, "error": payload if status == "error" else ""}
+
+        if args.record_id:
+            rec = get_record(s, domain, headers, catalog_id, str(args.record_id))
+            vals = rec.get("values") if isinstance(rec.get("values"), dict) else {}
+            scanned = 1
+            need, reason = should_process(vals)
+            if not need:
+                print(json.dumps({"ok": True, "skipped": True, "reason": reason}, ensure_ascii=False))
+                return 0
+            res = process_record(str(args.record_id), vals)
+            res.update({"mode": "single", "scanned": scanned, "processed": processed, "apiCalls": api_calls})
+            print(json.dumps(res, ensure_ascii=False))
             return 0
 
-        patch_record_values(s, domain, headers, catalog_id, str(args.record_id), out_vals)
+        # Scan mode: iterate catalog and fill only records with empty PdfText (and allowed by policy).
+        offset = 0
+        while scanned < args.max_scan and api_calls < args.budget:
+            page = list_records(s, domain, headers, catalog_id, limit=args.page_size, offset=offset)
+            if not page:
+                break
+            for rec in page:
+                if scanned >= args.max_scan or api_calls >= args.budget:
+                    break
+                scanned += 1
+                rid = str(rec.get("id") or "").strip()
+                vals = rec.get("values") if isinstance(rec.get("values"), dict) else {}
+                need, _reason = should_process(vals)
+                if not need:
+                    continue
+                _ = process_record(rid, vals)
+            offset += args.page_size
+
         print(
             json.dumps(
                 {
                     "ok": True,
-                    "status": status,
-                    "textLen": len(payload) if status == "ok" else 0,
-                    "error": payload if status == "error" else "",
+                    "mode": "scan",
+                    "scanned": scanned,
+                    "processed": processed,
+                    "apiCalls": api_calls,
+                    "okCount": ok_count,
+                    "emptyCount": empty_count,
+                    "errorCount": error_count,
+                    "dryRun": bool(args.dry_run),
                 },
                 ensure_ascii=False,
             )
