@@ -95,4 +95,27 @@ jobs:
           if [ "$DRY" = "true" ]; then ARGS+=(--dry-run); fi
           if [ "$DEBUG" = "true" ]; then ARGS+=(--debug); fi
 
-          python bpium_kad_pipeline_worker.py "${ARGS[@]}"
+          python bpium_kad_pipeline_worker.py "${ARGS[@]}" | tee pipeline_out.json
+
+          # Emit token/call usage summary into logs and Job Summary.
+          python - <<'PY'
+          import json, os
+          p = "pipeline_out.json"
+          with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+          api = int(d.get("apiCalls") or 0)
+          search = int(d.get("searchCalls") or 0)
+          details = int(d.get("detailsCalls") or 0)
+          pdf = int(d.get("pdfCalls") or 0)
+          processed = d.get("casesUpserted")
+          ok = d.get("pdfOk")
+          empty = d.get("pdfEmpty")
+          err = d.get("pdfErr")
+          line = f"parser-api calls used: {api} (search={search}, details={details}, pdf={pdf}); casesUpserted={processed}; pdf ok/empty/err={ok}/{empty}/{err}"
+          print(line)
+          summ = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summ:
+            with open(summ, "a", encoding="utf-8") as sf:
+              sf.write("### Parser-API budget\\n")
+              sf.write(line + "\\n")
+          PY

@@ -122,4 +122,24 @@ jobs:
           if [[ "${DRY}" == "true" ]]; then ARGS+=(--dry-run); fi
           if [[ "${DEBUG}" == "true" ]]; then ARGS+=(--debug-skip-reasons); fi
 
-          python bpium_pdftext_worker.py "${ARGS[@]}"
+          python bpium_pdftext_worker.py "${ARGS[@]}" | tee backfill_out.json
+
+          python - <<'PY'
+          import json, os
+          p = "backfill_out.json"
+          with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+          api = int(d.get("apiCalls") or 0)
+          ok = d.get("okCount")
+          empty = d.get("emptyCount")
+          err = d.get("errorCount")
+          scanned = d.get("scanned")
+          processed = d.get("processed")
+          line = f"parser-api calls used: {api}; scanned={scanned}; processed={processed}; pdf ok/empty/err={ok}/{empty}/{err}"
+          print(line)
+          summ = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summ:
+            with open(summ, "a", encoding="utf-8") as sf:
+              sf.write("### Parser-API budget\\n")
+              sf.write(line + "\\n")
+          PY

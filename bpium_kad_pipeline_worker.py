@@ -545,6 +545,7 @@ def main() -> int:
         "mode": "pipeline",
         "tracks": {"scanned": 0, "processed": 0},
         "apiCalls": 0,
+        "searchCalls": 0,
         "detailsCalls": 0,
         "pdfCalls": 0,
         "casesUpserted": 0,
@@ -761,6 +762,7 @@ def main() -> int:
                         api_calls_total += 1
                         per_track_api_calls += 1
                         out_summary["apiCalls"] += 1
+                        out_summary["searchCalls"] += 1
 
                         search = parser_api_search(
                             s,
@@ -818,6 +820,7 @@ def main() -> int:
                         api_calls_total += 1
                         per_track_api_calls += 1
                         out_summary["apiCalls"] += 1
+                        out_summary["searchCalls"] += 1
 
                         search = parser_api_search(
                             s,
