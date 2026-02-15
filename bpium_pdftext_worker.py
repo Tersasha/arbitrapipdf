@@ -299,6 +299,8 @@ def main() -> int:
         error_count = 0
         pages_fetched = 0
         skip_counts: Dict[str, int] = {}
+        min_id: Optional[int] = None
+        max_id: Optional[int] = None
 
         def should_process(vals: Dict[str, Any]) -> Tuple[bool, str]:
             pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
@@ -410,6 +412,12 @@ def main() -> int:
                     break
                 scanned += 1
                 rid = str(rec.get("id") or "").strip()
+                try:
+                    rid_i = int(rid)
+                    min_id = rid_i if min_id is None else min(min_id, rid_i)
+                    max_id = rid_i if max_id is None else max(max_id, rid_i)
+                except Exception:
+                    pass
                 vals = rec.get("values") if isinstance(rec.get("values"), dict) else {}
                 need, _reason = should_process(vals)
                 if not need:
@@ -431,6 +439,7 @@ def main() -> int:
         out: Dict[str, Any] = {
             "ok": True,
             "mode": "scan",
+            "catalogId": str(catalog_id),
             "scanned": scanned,
             "processed": processed,
             "apiCalls": api_calls,
@@ -438,6 +447,7 @@ def main() -> int:
             "emptyCount": empty_count,
             "errorCount": error_count,
             "pagesFetched": pages_fetched,
+            "scannedIdRange": {"minId": min_id, "maxId": max_id},
             "scanQuery": {
                 "viewId": scan_view_id,
                 "searchText": scan_search_text,
