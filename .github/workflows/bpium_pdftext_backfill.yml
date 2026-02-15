@@ -1,0 +1,68 @@
+name: Bpium PdfText Backfill (Single Record)
+
+on:
+  workflow_dispatch:
+    inputs:
+      record_id:
+        description: "Bpium record id to process (catalog 45 by default)"
+        required: true
+      budget:
+        description: "Max parser-api calls per run"
+        required: true
+        default: "1"
+      force:
+        description: "Process even if PdfText already exists (true/false)"
+        required: true
+        default: "false"
+      dry_run:
+        description: "Do not write to Bpium (true/false)"
+        required: true
+        default: "false"
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
+      BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
+      BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
+      PARSER_API_KEY: ${{ secrets.PARSER_API_KEY }}
+
+      # Optional overrides (secrets). Default values are in the script.
+      BPIUM_CATALOG_ID: ${{ secrets.BPIUM_CATALOG_ID }}
+      BPIUM_FIELD_PDF_URL: ${{ secrets.BPIUM_FIELD_PDF_URL }}
+      BPIUM_FIELD_PDF_TEXT: ${{ secrets.BPIUM_FIELD_PDF_TEXT }}
+      BPIUM_FIELD_PDF_TEXT_FETCHED_AT: ${{ secrets.BPIUM_FIELD_PDF_TEXT_FETCHED_AT }}
+      BPIUM_FIELD_PDF_TEXT_STATUS: ${{ secrets.BPIUM_FIELD_PDF_TEXT_STATUS }}
+      BPIUM_FIELD_PDF_TEXT_ERROR: ${{ secrets.BPIUM_FIELD_PDF_TEXT_ERROR }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          RID="${{ github.event.inputs.record_id }}"
+          BUDGET="${{ github.event.inputs.budget }}"
+          FORCE="${{ github.event.inputs.force }}"
+          DRY="${{ github.event.inputs.dry_run }}"
+
+          ARGS=(--record-id "$RID" --budget "$BUDGET")
+          if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
+          if [ "$DRY" = "true" ]; then ARGS+=(--dry-run); fi
+
+          python bpium_pdftext_worker.py "${ARGS[@]}"
+
