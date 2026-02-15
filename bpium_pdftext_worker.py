@@ -224,7 +224,13 @@ def main() -> int:
         if args.dry_run:
             print(
                 json.dumps(
-                    {"ok": True, "dryRun": True, "status": status, "textLen": len(payload) if status == "ok" else 0},
+                    {
+                        "ok": True,
+                        "dryRun": True,
+                        "status": status,
+                        "textLen": len(payload) if status == "ok" else 0,
+                        "error": payload if status == "error" else "",
+                    },
                     ensure_ascii=False,
                 )
             )
@@ -233,7 +239,12 @@ def main() -> int:
         patch_record_values(s, domain, headers, catalog_id, str(args.record_id), out_vals)
         print(
             json.dumps(
-                {"ok": True, "status": status, "textLen": len(payload) if status == "ok" else 0},
+                {
+                    "ok": True,
+                    "status": status,
+                    "textLen": len(payload) if status == "ok" else 0,
+                    "error": payload if status == "error" else "",
+                },
                 ensure_ascii=False,
             )
         )
