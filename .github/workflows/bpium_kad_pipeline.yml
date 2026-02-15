@@ -31,9 +31,7 @@ on:
         description: "Verbose output (true/false)"
         required: true
         default: "false"
-  schedule:
-    # Daily at 03:25 UTC. Conservative to protect API token budgets.
-    - cron: "25 3 * * *"
+  # NOTE: schedule disabled (manual runs only)
 
 permissions:
   contents: read
