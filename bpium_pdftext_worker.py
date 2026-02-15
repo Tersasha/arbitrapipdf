@@ -71,7 +71,10 @@ def parser_api_pdf_download(session: requests.Session, api_key: str, pdf_url: st
     if data.get("error") or data.get("error_code"):
         raise RuntimeError(f"parser-api error: {data}")
     if data.get("Success") is not None and int(data.get("Success") or 0) != 1:
-        raise RuntimeError(f"parser-api: Success!=1: {data}")
+        raise RuntimeError(
+            "parser-api: Success!=1 (check PARSER_API_KEY subscription/IP limits and that pdf_url is a direct kad.arbitr.ru PDF): "
+            + str(data)
+        )
     b64 = data.get("pdfContent")
     return "" if b64 is None else str(b64)
 
