@@ -46,26 +46,16 @@ on:
 
   # NOTE: schedule disabled (pipeline is handled by bpium_kad_pipeline.yml)
 
+permissions:
+  contents: read
+
 jobs:
   backfill:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     concurrency:
       group: bpium-pdftext-backfill
       cancel-in-progress: false
-    env:
-      BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
-      BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
-      BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
-      PARSER_API_KEY: ${{ secrets.PARSER_API_KEY }}
-
-      # Optional overrides (secrets). Default values are in the script.
-      BPIUM_CATALOG_ID: ${{ secrets.BPIUM_CATALOG_ID }}
-      BPIUM_FIELD_PDF_URL: ${{ secrets.BPIUM_FIELD_PDF_URL }}
-      BPIUM_FIELD_PDF_TEXT: ${{ secrets.BPIUM_FIELD_PDF_TEXT }}
-      BPIUM_FIELD_PDF_TEXT_FETCHED_AT: ${{ secrets.BPIUM_FIELD_PDF_TEXT_FETCHED_AT }}
-      BPIUM_FIELD_PDF_TEXT_STATUS: ${{ secrets.BPIUM_FIELD_PDF_TEXT_STATUS }}
-      BPIUM_FIELD_PDF_TEXT_ERROR: ${{ secrets.BPIUM_FIELD_PDF_TEXT_ERROR }}
 
     steps:
       - name: Checkout
@@ -76,27 +66,6 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Preflight (secrets/inputs)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          missing=()
-          [[ -z "${BPIUM_DOMAIN:-}" ]] && missing+=("BPIUM_DOMAIN")
-          [[ -z "${BPIUM_LOGIN:-}" ]] && missing+=("BPIUM_LOGIN")
-          [[ -z "${BPIUM_PASSWORD:-}" ]] && missing+=("BPIUM_PASSWORD")
-          [[ -z "${PARSER_API_KEY:-}" ]] && missing+=("PARSER_API_KEY")
-
-          if (( ${#missing[@]} > 0 )); then
-            echo "::error title=Missing GitHub Secrets::${missing[*]}"
-            exit 1
-          fi
-
-          if [[ "${BPIUM_DOMAIN}" != http*://* ]]; then
-            echo "::error title=Invalid BPIUM_DOMAIN::Expected full base URL like https://mtkkidney.bpium.ru (got '${BPIUM_DOMAIN}')"
-            exit 1
-          fi
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
@@ -104,6 +73,19 @@ jobs:
 
       - name: Run worker
         shell: bash
+        env:
+          BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
+          BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
+          BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
+          PARSER_API_KEY: ${{ secrets.PARSER_API_KEY }}
+
+          # Optional overrides (kept as secrets for compatibility; script has safe defaults).
+          BPIUM_CATALOG_ID: ${{ secrets.BPIUM_CATALOG_ID }}
+          BPIUM_FIELD_PDF_URL: ${{ secrets.BPIUM_FIELD_PDF_URL }}
+          BPIUM_FIELD_PDF_TEXT: ${{ secrets.BPIUM_FIELD_PDF_TEXT }}
+          BPIUM_FIELD_PDF_TEXT_FETCHED_AT: ${{ secrets.BPIUM_FIELD_PDF_TEXT_FETCHED_AT }}
+          BPIUM_FIELD_PDF_TEXT_STATUS: ${{ secrets.BPIUM_FIELD_PDF_TEXT_STATUS }}
+          BPIUM_FIELD_PDF_TEXT_ERROR: ${{ secrets.BPIUM_FIELD_PDF_TEXT_ERROR }}
         run: |
           set -euo pipefail
           # For schedule runs, inputs.* will be empty; use safe defaults.

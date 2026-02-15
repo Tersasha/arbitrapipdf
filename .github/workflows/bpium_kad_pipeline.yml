@@ -30,10 +30,13 @@ on:
       debug:
         description: "Verbose output (true/false)"
         required: true
-        default: "true"
+        default: "false"
   schedule:
     # Daily at 03:25 UTC. Conservative to protect API token budgets.
     - cron: "25 3 * * *"
+
+permissions:
+  contents: read
 
 concurrency:
   group: bpium-kad-pipeline
@@ -41,13 +44,9 @@ concurrency:
 
 jobs:
   pipeline:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
-      BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
-      BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
-      PARSER_API_KEY: ${{ secrets.PARSER_API_KEY }}
       PIPELINE_ROLLING_MONTHS: "6"
       PIPELINE_SOURCE: "parser-api/kad"
 
@@ -67,6 +66,11 @@ jobs:
 
       - name: Run pipeline
         shell: bash
+        env:
+          BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
+          BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
+          BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
+          PARSER_API_KEY: ${{ secrets.PARSER_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -84,7 +88,7 @@ jobs:
           if [ -z "$MAX_CASES" ]; then MAX_CASES="50"; fi
           if [ -z "$ROLL_PAGES" ]; then ROLL_PAGES="3"; fi
           if [ -z "$DRY" ]; then DRY="false"; fi
-          if [ -z "$DEBUG" ]; then DEBUG="true"; fi
+          if [ -z "$DEBUG" ]; then DEBUG="false"; fi
 
           ARGS=(--max-tracks-per-run "$MAX_TRACKS" --max-parser-api-calls "$MAX_CALLS" --max-cases-per-track "$MAX_CASES" --rolling-max-pages "$ROLL_PAGES")
           if [ -n "$TRACK" ]; then ARGS+=(--track-record-id "$TRACK"); fi
@@ -92,4 +96,3 @@ jobs:
           if [ "$DEBUG" = "true" ]; then ARGS+=(--debug); fi
 
           python bpium_kad_pipeline_worker.py "${ARGS[@]}"
-

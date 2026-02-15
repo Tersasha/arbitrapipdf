@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from pypdf import PdfReader
 
+from bpium_http import redact_sensitive, request_json
+
 
 def iso_utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -35,45 +37,7 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
         return None
 
 
-def request_json(
-    session: requests.Session,
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    *,
-    params: Optional[Dict[str, str]] = None,
-    json_body: Any = None,
-    timeout: int = 60,
-    retries: int = 2,
-    backoff: Tuple[int, ...] = (1, 2),
-) -> Any:
-    last_exc: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            resp = session.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
-            resp.raise_for_status()
-            if not resp.content:
-                return None
-            return resp.json()
-        except requests.HTTPError as exc:
-            # Make Actions logs self-contained: show response status/url and a small body snippet.
-            resp = exc.response
-            if resp is not None:
-                try:
-                    snippet = (resp.text or "").replace("\r", " ").replace("\n", " ")[:800]
-                except Exception:
-                    snippet = "<unavailable>"
-                raise RuntimeError(f"HTTP {resp.status_code} for {resp.url}; body={snippet!r}") from exc
-            raise
-        except (requests.RequestException, ValueError) as exc:
-            last_exc = exc
-            if attempt < retries - 1:
-                time.sleep(backoff[attempt] if attempt < len(backoff) else 2**attempt)
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("request failed without exception")
+# request_json is imported from bpium_http to avoid leaking secrets in URL/headers.
 
 
 def parser_api_pdf_download(session: requests.Session, api_key: str, pdf_url: str) -> str:
@@ -350,7 +314,7 @@ def main() -> int:
                 else:
                     status, payload = extract_text_from_pdf_base64(b64)
             except Exception as exc:
-                status, payload = "error", str(exc)
+                status, payload = "error", redact_sensitive(str(exc))
 
             if status == "ok":
                 ok_count += 1

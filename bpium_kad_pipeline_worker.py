@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from pypdf import PdfReader
 
+from bpium_http import redact_sensitive, request_json
+
 
 PARSER_API_BASE = "https://parser-api.com/parser/arbitr_api"
 
@@ -126,44 +128,9 @@ def date_minus_months(d: date, months: int) -> date:
     return date(y, m, min(d.day, last_day))
 
 
-def request_json(
-    session: requests.Session,
-    method: str,
-    url: str,
-    headers: Dict[str, str],
-    *,
-    params: Optional[Dict[str, str]] = None,
-    json_body: Any = None,
-    timeout: int = 60,
-    retries: int = 2,
-    backoff: Tuple[int, ...] = (1, 2),
-) -> Any:
-    last_exc: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            resp = session.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
-            resp.raise_for_status()
-            if not resp.content:
-                return None
-            return resp.json()
-        except requests.HTTPError as exc:
-            resp = exc.response
-            if resp is not None:
-                try:
-                    snippet = (resp.text or "").replace("\r", " ").replace("\n", " ")[:800]
-                except Exception:
-                    snippet = "<unavailable>"
-                raise RuntimeError(f"HTTP {resp.status_code} for {resp.url}; body={snippet!r}") from exc
-            raise
-        except (requests.RequestException, ValueError) as exc:
-            last_exc = exc
-            if attempt < retries - 1:
-                time.sleep(backoff[attempt] if attempt < len(backoff) else 2**attempt)
-                continue
-            raise
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("request failed without exception")
+#
+# request_json is imported from bpium_http to avoid leaking secrets in URL/headers.
+#
 
 
 def bpium_list_records(
@@ -740,7 +707,7 @@ def main() -> int:
                         if not args.dry_run and rid45:
                             bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch)
                     except Exception as exc:
-                        last_error = f"details_by_id failed for CaseId={case_id}: {exc}"
+                        last_error = redact_sensitive(f"details_by_id failed for CaseId={case_id}: {exc}")
 
                 if pdf_url and not pdf_text and api_calls_total < int(args.max_parser_api_calls):
                     try:
@@ -756,6 +723,7 @@ def main() -> int:
                             status, payload = extract_text_from_pdf_base64(b64)
                     except Exception as exc:
                         status, payload = "error", str(exc)
+                        payload = redact_sensitive(payload)
 
                     now = iso_utc_now()
                     if status == "ok":
@@ -767,7 +735,7 @@ def main() -> int:
                     else:
                         per_track_pdf_err += 1
                         out_summary["pdfErr"] += 1
-                        last_error = payload
+                        last_error = redact_sensitive(payload)
 
                     patch2: Dict[str, Any] = {
                         fields_45["pdf_text_status"]: status,
@@ -803,7 +771,7 @@ def main() -> int:
                             date_to="",
                         )
                     except Exception as exc:
-                        last_error = f"search(backfill) failed: {exc}"
+                        last_error = redact_sensitive(f"search(backfill) failed: {exc}")
                         break
 
                     cases = as_list(search.get("Cases"))
@@ -860,7 +828,7 @@ def main() -> int:
                             date_to=dt_rolling,
                         )
                     except Exception as exc:
-                        last_error = f"search(rolling) failed: {exc}"
+                        last_error = redact_sensitive(f"search(rolling) failed: {exc}")
                         break
                     cases = as_list(search.get("Cases"))
                     pages_count = int(search.get("PagesCount") or 0)
@@ -894,7 +862,7 @@ def main() -> int:
                 "updatedAt": iso_utc_now(),
             }
             if last_error:
-                cursor["last"]["error"] = last_error
+                cursor["last"]["error"] = redact_sensitive(last_error)
 
             status = (
                 f"{cursor.get('mode')} api={per_track_api_calls} cases={per_track_cases_upserted} "
@@ -916,7 +884,7 @@ def main() -> int:
                         f44_last_req_count: str(per_track_api_calls),
                         f44_last_req_log: cursor_to_json(cursor),
                         f44_last_sync_status: status,
-                        f44_last_sync_error: last_error,
+                        f44_last_sync_error: redact_sensitive(last_error),
                     },
                 )
 
