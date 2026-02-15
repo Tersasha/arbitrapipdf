@@ -1,10 +1,12 @@
-# Bpium PdfText Worker (GitHub Actions)
+# Bpium KAD Pipeline (GitHub Actions)
 
-This repo runs a small worker in GitHub Actions to:
-1. read a single Bpium record,
-2. download a PDF via parser-api (`/pdf_download`) as base64,
-3. extract text from PDF,
-4. write text to a Bpium field (`PdfText`) and store status/error.
+This repo runs workers in GitHub Actions to sync арбитражные дела (KAD) into Bpium and extract PDF text:
+1. scan tracking records in Bpium catalog 44 (INN + SearchFromDate),
+2. search cases via parser-api (`/search`) and upsert them into Bpium catalog 45,
+3. fetch case details (`/details_by_id`) to get `PdfUrl` + store `DetailsJson`,
+4. download PDF via parser-api (`/pdf_download`) as base64,
+5. extract `PdfText` using `pypdf`,
+6. (optional) enrich catalog 45 with flattened MVP fields from `DetailsJson` (no parser-api calls for backfill).
 
 No local server is required.
 
@@ -26,22 +28,39 @@ Optional (only if your field IDs differ from defaults):
 - `BPIUM_FIELD_PDF_TEXT_STATUS` (default: `21`)
 - `BPIUM_FIELD_PDF_TEXT_ERROR` (default: `22`)
 
-## 2) Run
-GitHub -> `Actions` -> `Bpium PdfText Backfill` -> `Run workflow`
+## 2) Workflows
+### 2.1 Main pipeline (44 -> 45 + PdfText)
+GitHub -> `Actions` -> `Bpium KAD Pipeline (44 -> 45 PdfText)` -> `Run workflow`
 
 Inputs:
-- `record_id` (optional) - if empty, the worker scans the catalog and fills records with empty `PdfText`
-- `budget` (default: 10) - max parser-api calls (keep small to protect tokens)
-- `page_size` (default: 100) - Bpium page size for scanning
-- `max_scan` (default: 2000) - max records to scan per run
-- `retry_errors` (default: true) - retry records with `PdfTextStatus=error` (with cooldown)
-- `cooldown_hours` (default: 24) - skip recently-attempted records unless `force=true`
-- `force` (default: false) - write even if `PdfText` already exists
-- `dry_run` (default: false) - do not write back to Bpium
+- `track_record_id` (optional) - process exactly one tracking record from catalog 44
+- `max_tracks_per_run` (default: 1) - keep small to protect parser-api token budget
+- `max_parser_api_calls` (default: 15) - budget per run
+- `max_cases_per_track` (default: 50)
+- `rolling_max_pages` (default: 3)
+- `dry_run` (default: false)
+- `debug` (default: false)
 
-## 3) Notes
-- The worker does NOT depend on Java/PDFBox in Bpium. It extracts text with `pypdf`.
-- It is safe to keep this repo public if you never commit secrets into the code.
+### 2.2 Enrich backfill (catalog 45 from existing DetailsJson, no parser-api calls)
+GitHub -> `Actions` -> `Bpium KAD Enrich Backfill (catalog 45 from DetailsJson)` -> `Run workflow`
 
-## 4) Automatic mode
-The workflow has an hourly schedule (`cron`) and will process a small batch each run (default budget: 10).
+This workflow reads existing records in catalog 45 and fills new MVP fields from `DetailsJson` **without** spending parser-api calls.
+
+### 2.3 (Deprecated) PdfText backfill
+Workflow `(Deprecated) Bpium PdfText Backfill (manual)` is kept as a manual tool.
+
+## 3) Catalog 45 schema patch (append-only)
+To add MVP enrichment fields into Bpium catalog 45 without deleting existing fields:
+
+```bash
+python bpium_patch_catalog_fields.py --domain https://<tenant>.bpium.ru --catalog-id 45 --preset results45_enrich_mvp
+```
+
+This script is **append-only**: it first `GET`s catalog fields, appends missing new ones, and then `PATCH`es the full fields array.
+
+## 4) Notes
+- PDF text extraction is done in GitHub Actions with `pypdf` (Bpium does not need PDFBox/Java).
+- Keep this repo public only if you never commit any secrets.
+
+## 5) Automatic mode
+`Bpium KAD Pipeline` has a daily schedule and processes a conservative batch each run.

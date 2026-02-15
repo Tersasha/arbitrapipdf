@@ -128,6 +128,151 @@ def date_minus_months(d: date, months: int) -> date:
     return date(y, m, min(d.day, last_day))
 
 
+def parse_iso_dt(s: Any) -> Optional[datetime]:
+    ss = str(s or "").strip()
+    if not ss:
+        return None
+    try:
+        if ss.endswith("Z"):
+            return datetime.fromisoformat(ss.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ss)
+    except Exception:
+        return None
+
+
+def dt_to_utc_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def select_case_root(details: Any) -> Dict[str, Any]:
+    root = as_dict(details)
+    cases = as_list(root.get("Cases"))
+    if cases and isinstance(cases[0], dict):
+        return as_dict(cases[0])
+    return root
+
+
+def short_list_by_name(items: List[Dict[str, Any]]) -> str:
+    names = [str(it.get("Name") or "").strip() for it in items if isinstance(it, dict) and str(it.get("Name") or "").strip()]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return f"{names[0]}; еще {len(names) - 1}"
+
+
+def join_names(items: List[Dict[str, Any]]) -> str:
+    out: List[str] = []
+    for it in items:
+        nm = str(it.get("Name") or "").strip()
+        if nm:
+            out.append(nm)
+    return "; ".join(out)
+
+
+def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
+    case = select_case_root(details)
+
+    plaintiffs = [x for x in as_list(case.get("Plaintiffs")) if isinstance(x, dict)]
+    respondents = [x for x in as_list(case.get("Respondents")) if isinstance(x, dict)]
+    thirds = [x for x in as_list(case.get("Thirds")) if isinstance(x, dict)]
+
+    instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
+    cur_inst: Optional[Dict[str, Any]] = None
+    if instances:
+        def inst_num(x: Dict[str, Any]) -> int:
+            try:
+                return int(x.get("InstanceNumber") or 0)
+            except Exception:
+                return 0
+        cur_inst = sorted(instances, key=inst_num)[-1]
+
+    court = as_dict(cur_inst.get("Court")) if isinstance(cur_inst, dict) else {}
+    judges = [x for x in as_list(cur_inst.get("Judges")) if isinstance(x, dict)] if isinstance(cur_inst, dict) else []
+
+    now = datetime.now(timezone.utc)
+    hearings = [x for x in as_list(case.get("CourtHearings")) if isinstance(x, dict)]
+    future: List[Tuple[datetime, Dict[str, Any]]] = []
+    for h in hearings:
+        d = parse_iso_dt(h.get("Start"))
+        if d is None:
+            continue
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        if d >= now:
+            future.append((d, h))
+    future.sort(key=lambda t: t[0])
+    next_h = future[0][1] if future else None
+
+    events: List[Dict[str, Any]] = []
+    for inst in instances:
+        for ev in as_list(inst.get("InstanceEvents")):
+            if isinstance(ev, dict):
+                events.append(ev)
+
+    max_sum = 0.0
+    for ev in events:
+        try:
+            v = float(ev.get("ClaimSum") or 0)
+        except Exception:
+            v = 0.0
+        if v > max_sum:
+            max_sum = v
+
+    def ev_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+        for k in ("PublishDate", "Date"):
+            d = parse_iso_dt(ev.get(k))
+            if d is not None:
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                return d
+        return None
+
+    last_ev: Optional[Dict[str, Any]] = None
+    last_ev_dt: Optional[datetime] = None
+    for ev in events:
+        d = ev_dt(ev)
+        if d is None:
+            continue
+        if last_ev_dt is None or d > last_ev_dt:
+            last_ev_dt = d
+            last_ev = ev
+
+    docs = [ev for ev in events if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http")]
+    signed = [ev for ev in events if ev.get("HasSignature") is True]
+
+    out: Dict[str, Any] = {
+        "ClaimSumValue": max_sum if max_sum > 0 else None,
+        "ClaimCurrency": "RUB" if max_sum > 0 else "",
+        "PlaintiffsShort": short_list_by_name(plaintiffs),
+        "RespondentsShort": short_list_by_name(respondents),
+        "PlaintiffsCount": len(plaintiffs),
+        "RespondentsCount": len(respondents),
+        "ThirdsCount": len(thirds),
+        "CurrentInstance": str(cur_inst.get("Name") or "").strip() if isinstance(cur_inst, dict) else "",
+        "CourtCode": str(court.get("Code") or "").strip(),
+        "CourtName": str(court.get("Name") or "").strip(),
+        "Judges": join_names(judges),
+        "NextHearingAt": dt_to_utc_z(parse_iso_dt(next_h.get("Start"))) if isinstance(next_h, dict) and parse_iso_dt(next_h.get("Start")) else "",
+        "NextHearingLocation": str(next_h.get("Location") or "").strip() if isinstance(next_h, dict) else "",
+        "LastEventAt": dt_to_utc_z(last_ev_dt) if last_ev_dt is not None else "",
+        "LastEventSummary": (
+            f"{str(last_ev.get('EventTypeName') or '').strip()} / {str(last_ev.get('EventContentTypeName') or '').strip()}"
+            if isinstance(last_ev, dict)
+            else ""
+        ).strip(" /"),
+        "LastEventUrl": str(last_ev.get("File") or "").strip() if isinstance(last_ev, dict) and isinstance(last_ev.get("File"), str) else "",
+        "DocsCount": len(docs),
+        "SignedDocsCount": len(signed),
+        "HasSignedDocs": True if len(signed) > 0 else False,
+    }
+    if out.get("ClaimSumValue") is None:
+        out.pop("ClaimSumValue", None)
+    return out
+
+
 #
 # request_json is imported from bpium_http to avoid leaking secrets in URL/headers.
 #
@@ -209,6 +354,22 @@ def bpium_create_record(
     if not isinstance(data, dict):
         raise RuntimeError(f"Unexpected create record response: {type(data)}")
     return data
+
+
+def bpium_get_catalog_fields_map(
+    session: requests.Session,
+    base_url: str,
+    headers: Dict[str, str],
+    catalog_id: str,
+) -> Dict[str, str]:
+    data = request_json(session, "GET", f"{base_url}/api/v1/catalogs/{catalog_id}", headers=headers, timeout=60)
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for f in data.get("fields") or []:
+        if isinstance(f, dict) and f.get("id") is not None:
+            out[str(f.get("name", "")).strip()] = str(f.get("id"))
+    return out
 
 
 def parser_api_search(
@@ -552,11 +713,42 @@ def main() -> int:
         "pdfOk": 0,
         "pdfEmpty": 0,
         "pdfErr": 0,
+        "enrichOk": 0,
+        "enrichSkip": 0,
+        "enrichErr": 0,
         "dryRun": bool(args.dry_run),
         "updatedAt": iso_utc_now(),
     }
 
     with requests.Session() as s:
+        # Resolve enriched field ids by name. If fields are not added yet, enrichment is skipped.
+        cat45_name_to_id = bpium_get_catalog_fields_map(s, domain, headers, cat_45)
+        mvp_field_names = [
+            "ClaimSumValue",
+            "ClaimCurrency",
+            "PlaintiffsShort",
+            "RespondentsShort",
+            "PlaintiffsCount",
+            "RespondentsCount",
+            "ThirdsCount",
+            "CurrentInstance",
+            "CourtCode",
+            "CourtName",
+            "Judges",
+            "NextHearingAt",
+            "NextHearingLocation",
+            "LastEventAt",
+            "LastEventSummary",
+            "LastEventUrl",
+            "DocsCount",
+            "SignedDocsCount",
+            "HasSignedDocs",
+            "EnrichAt",
+            "EnrichStatus",
+            "EnrichError",
+        ]
+        mvp_ids: Dict[str, str] = {n: cat45_name_to_id[n] for n in mvp_field_names if n in cat45_name_to_id}
+
         track_records: List[Dict[str, Any]] = []
         if args.track_record_id:
             track_records = [bpium_get_record(s, domain, headers, cat_44, str(args.track_record_id))]
@@ -713,8 +905,86 @@ def main() -> int:
 
                 pdf_url = str(get_value(vals45, fields_45["pdf_url"]) or "").strip()
                 pdf_text = str(get_value(vals45, fields_45["pdf_text"]) or "").strip()
+                details_json_existing = str(get_value(vals45, fields_45["details_json"]) or "").strip()
 
-                if not pdf_url and api_calls_total < int(args.max_parser_api_calls):
+                # Enrichment (MVP fields) is best-effort and "only empty": it must not overwrite existing values.
+                enrich_attempted = False
+                enrich_updated = False
+                enrich_failed = False
+
+                def is_blank(v: Any) -> bool:
+                    if v is None:
+                        return True
+                    if isinstance(v, str):
+                        return not v.strip()
+                    if isinstance(v, list):
+                        return len(v) == 0
+                    return False
+
+                fid_enrich_at = mvp_ids.get("EnrichAt")
+                fid_enrich_status = mvp_ids.get("EnrichStatus")
+                fid_enrich_error = mvp_ids.get("EnrichError")
+
+                def try_enrich_from_details(details_obj: Dict[str, Any], *, source_tag: str) -> None:
+                    nonlocal last_error, enrich_attempted, enrich_updated, enrich_failed
+
+                    if not mvp_ids:
+                        return
+                    if not rid45:
+                        return
+                    if args.dry_run:
+                        return
+
+                    enrich_attempted = True
+                    try:
+                        mvp = extract_mvp_from_details(details_obj)
+                        patch_mvp: Dict[str, Any] = {}
+                        changed = 0
+                        for name, val in mvp.items():
+                            fid = mvp_ids.get(name)
+                            if not fid:
+                                continue
+                            if is_blank(get_value(vals45, fid)):
+                                patch_mvp[fid] = val
+                                changed += 1
+
+                        cur_status = str(get_value(vals45, fid_enrich_status) or "").strip() if fid_enrich_status else ""
+                        status_should_update = (not cur_status) or (cur_status == "error")
+
+                        if changed > 0:
+                            enrich_updated = True
+                            if fid_enrich_status and status_should_update:
+                                patch_mvp[fid_enrich_status] = "ok"
+                            if fid_enrich_error and (status_should_update or is_blank(get_value(vals45, fid_enrich_error))):
+                                patch_mvp[fid_enrich_error] = ""
+                            if fid_enrich_at and (status_should_update or is_blank(get_value(vals45, fid_enrich_at))):
+                                patch_mvp[fid_enrich_at] = iso_utc_now()
+
+                            bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_mvp)
+                        else:
+                            # Nothing to fill (already has values). Do not touch meta fields to avoid churn.
+                            return
+                    except Exception as exc:
+                        enrich_failed = True
+                        msg = redact_sensitive(f"enrich failed ({source_tag}) CaseId={case_id}: {exc}")
+                        last_error = msg
+                        if fid_enrich_status and (not str(get_value(vals45, fid_enrich_status) or "").strip()):
+                            patch_err: Dict[str, Any] = {fid_enrich_status: "error"}
+                            if fid_enrich_error:
+                                patch_err[fid_enrich_error] = msg
+                            if fid_enrich_at:
+                                patch_err[fid_enrich_at] = iso_utc_now()
+                            bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_err)
+
+                # Fast path: enrich from already saved DetailsJson (no parser-api calls).
+                if details_json_existing and mvp_ids:
+                    try:
+                        try_enrich_from_details(json.loads(details_json_existing), source_tag="DetailsJson")
+                    except Exception:
+                        # json decode errors are handled inside try_enrich_from_details, but keep this extra guard.
+                        pass
+
+                if (not details_json_existing or not pdf_url) and api_calls_total < int(args.max_parser_api_calls):
                     try:
                         api_calls_total += 1
                         per_track_api_calls += 1
@@ -735,6 +1005,10 @@ def main() -> int:
 
                         if not args.dry_run and rid45:
                             bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch)
+
+                        # Enrich from fresh details response (does not spend extra parser-api calls).
+                        if mvp_ids:
+                            try_enrich_from_details(details, source_tag="details_by_id")
                     except Exception as exc:
                         last_error = redact_sensitive(f"details_by_id failed for CaseId={case_id}: {exc}")
 
@@ -774,6 +1048,15 @@ def main() -> int:
                     }
                     if not args.dry_run and rid45:
                         bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch2)
+
+                # Finalize enrichment counters for this case (only once per case).
+                if mvp_ids and enrich_attempted:
+                    if enrich_failed:
+                        out_summary["enrichErr"] += 1
+                    elif enrich_updated:
+                        out_summary["enrichOk"] += 1
+                    else:
+                        out_summary["enrichSkip"] += 1
 
             backfill_done = False
 

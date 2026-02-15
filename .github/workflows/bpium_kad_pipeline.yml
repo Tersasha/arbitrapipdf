@@ -111,7 +111,11 @@ jobs:
           ok = d.get("pdfOk")
           empty = d.get("pdfEmpty")
           err = d.get("pdfErr")
-          line = f"parser-api calls used: {api} (search={search}, details={details}, pdf={pdf}); casesUpserted={processed}; pdf ok/empty/err={ok}/{empty}/{err}"
+          enrich_ok = d.get("enrichOk")
+          enrich_skip = d.get("enrichSkip")
+          enrich_err = d.get("enrichErr")
+          line = (
+            f\"parser-api calls used: {api} (search={search}, details={details}, pdf={pdf}); \"\n+            f\"casesUpserted={processed}; pdf ok/empty/err={ok}/{empty}/{err}; \"\n+            f\"enrich ok/skip/err={enrich_ok}/{enrich_skip}/{enrich_err}\"\n+          )
           print(line)
           summ = os.environ.get("GITHUB_STEP_SUMMARY")
           if summ:
