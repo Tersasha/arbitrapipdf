@@ -1,4 +1,4 @@
-name: Bpium PdfText Backfill
+name: "(Deprecated) Bpium PdfText Backfill (manual)"
 
 on:
   workflow_dispatch:
@@ -44,9 +44,7 @@ on:
         required: true
         default: "false"
 
-  schedule:
-    # Automatic backfill in small batches to protect parser-api limits.
-    - cron: "17 * * * *"
+  # NOTE: schedule disabled (pipeline is handled by bpium_kad_pipeline.yml)
 
 jobs:
   backfill:
