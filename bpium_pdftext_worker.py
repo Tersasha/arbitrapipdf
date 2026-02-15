@@ -206,6 +206,11 @@ def main() -> int:
     )
     ap.add_argument("--force", action="store_true", help="Write even if PdfText already exists")
     ap.add_argument("--dry-run", action="store_true", help="Do not write to Bpium")
+    ap.add_argument(
+        "--debug-skip-reasons",
+        action="store_true",
+        help="Include skip reason statistics in scan mode output (default: false)",
+    )
     args = ap.parse_args()
 
     domain = os.getenv("BPIUM_DOMAIN", "").rstrip("/")
@@ -239,6 +244,8 @@ def main() -> int:
         ok_count = 0
         empty_count = 0
         error_count = 0
+        pages_fetched = 0
+        skip_counts: Dict[str, int] = {}
 
         def should_process(vals: Dict[str, Any]) -> Tuple[bool, str]:
             pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
@@ -325,38 +332,51 @@ def main() -> int:
 
         # Scan mode: iterate catalog and fill only records with empty PdfText (and allowed by policy).
         offset = 0
-        while scanned < args.max_scan and api_calls < args.budget:
+        # Note: budget controls *parser-api* calls (processing), not Bpium scanning.
+        # This allows running with --budget 0 to "scan-only" (no parser-api calls), useful for debugging.
+        while scanned < args.max_scan:
             page = list_records(s, domain, headers, catalog_id, limit=args.page_size, offset=offset)
             if not page:
                 break
+            pages_fetched += 1
             for rec in page:
-                if scanned >= args.max_scan or api_calls >= args.budget:
+                if scanned >= args.max_scan:
                     break
                 scanned += 1
                 rid = str(rec.get("id") or "").strip()
                 vals = rec.get("values") if isinstance(rec.get("values"), dict) else {}
                 need, _reason = should_process(vals)
                 if not need:
+                    if args.debug_skip_reasons:
+                        skip_counts[_reason] = skip_counts.get(_reason, 0) + 1
                     continue
+                # Budget can be 0 => scan-only
+                if args.budget < 1 or api_calls >= args.budget:
+                    if args.debug_skip_reasons:
+                        skip_counts["budget_exhausted"] = skip_counts.get("budget_exhausted", 0) + 1
+                    # Stop early to avoid rescanning the whole catalog when we already hit the budget.
+                    # This keeps scheduled runs cheap.
+                    break
                 _ = process_record(rid, vals)
             offset += args.page_size
+            if args.budget >= 1 and api_calls >= args.budget:
+                break
 
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "mode": "scan",
-                    "scanned": scanned,
-                    "processed": processed,
-                    "apiCalls": api_calls,
-                    "okCount": ok_count,
-                    "emptyCount": empty_count,
-                    "errorCount": error_count,
-                    "dryRun": bool(args.dry_run),
-                },
-                ensure_ascii=False,
-            )
-        )
+        out: Dict[str, Any] = {
+            "ok": True,
+            "mode": "scan",
+            "scanned": scanned,
+            "processed": processed,
+            "apiCalls": api_calls,
+            "okCount": ok_count,
+            "emptyCount": empty_count,
+            "errorCount": error_count,
+            "pagesFetched": pages_fetched,
+            "dryRun": bool(args.dry_run),
+        }
+        if args.debug_skip_reasons:
+            out["skipReasons"] = dict(sorted(skip_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+        print(json.dumps(out, ensure_ascii=False))
         return 0
 
 

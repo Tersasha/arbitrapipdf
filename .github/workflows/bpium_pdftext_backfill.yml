@@ -35,6 +35,10 @@ on:
         description: "Do not write to Bpium (true/false)"
         required: true
         default: "false"
+      debug:
+        description: "Include skip reason statistics in output (true/false)"
+        required: true
+        default: "false"
 
   schedule:
     # Automatic backfill in small batches to protect parser-api limits.
@@ -109,6 +113,7 @@ jobs:
           COOLDOWN_HOURS="${{ github.event.inputs.cooldown_hours }}"
           FORCE="${{ github.event.inputs.force }}"
           DRY="${{ github.event.inputs.dry_run }}"
+          DEBUG="${{ github.event.inputs.debug }}"
 
           # Schedule defaults (small batch).
           if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
@@ -120,6 +125,7 @@ jobs:
             COOLDOWN_HOURS="24"
             FORCE="false"
             DRY="false"
+            DEBUG="false"
           fi
 
           ARGS=(--budget "$BUDGET" --page-size "$PAGE_SIZE" --max-scan "$MAX_SCAN" --cooldown-hours "$COOLDOWN_HOURS")
@@ -127,5 +133,6 @@ jobs:
           if [[ "${RETRY_ERRORS}" == "true" ]]; then ARGS+=(--retry-errors); fi
           if [[ "${FORCE}" == "true" ]]; then ARGS+=(--force); fi
           if [[ "${DRY}" == "true" ]]; then ARGS+=(--dry-run); fi
+          if [[ "${DEBUG}" == "true" ]]; then ARGS+=(--debug-skip-reasons); fi
 
           python bpium_pdftext_worker.py "${ARGS[@]}"
