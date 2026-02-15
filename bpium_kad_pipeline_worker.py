@@ -941,12 +941,17 @@ def main() -> int:
                         patch_mvp: Dict[str, Any] = {}
                         changed = 0
                         for name, val in mvp.items():
-                            fid = mvp_ids.get(name)
-                            if not fid:
-                                continue
-                            if is_blank(get_value(vals45, fid)):
-                                patch_mvp[fid] = val
-                                changed += 1
+                             fid = mvp_ids.get(name)
+                             if not fid:
+                                 continue
+                             # Do not write empty strings / None into Bpium (typed fields like date reject them).
+                             if val is None:
+                                 continue
+                             if isinstance(val, str) and not val.strip():
+                                 continue
+                             if is_blank(get_value(vals45, fid)):
+                                 patch_mvp[fid] = val
+                                 changed += 1
 
                         cur_status = str(get_value(vals45, fid_enrich_status) or "").strip() if fid_enrich_status else ""
                         status_should_update = (not cur_status) or (cur_status == "error")

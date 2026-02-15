@@ -53,6 +53,24 @@ def has_value(v: Any) -> bool:
     return True
 
 
+def is_meaningful_value(v: Any) -> bool:
+    """
+    Decide whether we should WRITE the extracted value into Bpium.
+
+    We must not patch "empty" values into typed fields (e.g. date), because Bpium can reject them
+    with validation errors ("Invalid Date"). Also we avoid overwriting already-filled fields.
+    """
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, bool):
+        return True
+    if isinstance(v, (int, float)):
+        return True
+    return bool(str(v).strip())
+
+
 def bpium_get_catalog_fields_map(session: requests.Session, base_url: str, headers: Dict[str, str], catalog_id: str) -> Dict[str, str]:
     data = request_json(session, "GET", f"{base_url}/api/v1/catalogs/{catalog_id}", headers=headers, timeout=60)
     if not isinstance(data, dict):
@@ -372,6 +390,8 @@ def main() -> int:
                     fid = mvp_ids.get(name)
                     if not fid:
                         continue
+                    if not is_meaningful_value(value):
+                        continue
                     if args.force or not has_value(get_value(vals, str(fid))):
                         patch[str(fid)] = value
 
@@ -389,8 +409,21 @@ def main() -> int:
 
                 processed += 1
                 if not args.dry_run and rid:
-                    bpium_patch_record_values(s, domain, headers, str(args.catalog_id), rid, patch)
-                updated += 1
+                    try:
+                        bpium_patch_record_values(s, domain, headers, str(args.catalog_id), rid, patch)
+                        updated += 1
+                    except Exception as exc:
+                        errors += 1
+                        if args.debug:
+                            print(
+                                json.dumps(
+                                    {"recordId": rid, "status": "error", "error": redact_sensitive(str(exc))},
+                                    ensure_ascii=False,
+                                )
+                            )
+                        continue
+                else:
+                    updated += 1
                 if args.debug:
                     print(json.dumps({"recordId": rid, "status": "updated", "keys": list(patch.keys())}, ensure_ascii=False))
 
@@ -414,4 +447,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
