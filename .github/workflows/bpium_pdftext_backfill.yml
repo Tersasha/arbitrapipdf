@@ -27,6 +27,10 @@ on:
         description: "Skip recently-attempted records unless --force (hours)"
         required: true
         default: "24"
+      filters_json:
+        description: "Bpium filters JSON (optional). Example: {\"7\":\"kad.arbitr.ru\"}. Use {} to disable default filter."
+        required: false
+        default: ""
       force:
         description: "Process even if PdfText already exists (true/false)"
         required: true
@@ -111,6 +115,7 @@ jobs:
           MAX_SCAN="${{ github.event.inputs.max_scan }}"
           RETRY_ERRORS="${{ github.event.inputs.retry_errors }}"
           COOLDOWN_HOURS="${{ github.event.inputs.cooldown_hours }}"
+          FILTERS_JSON="${{ github.event.inputs.filters_json }}"
           FORCE="${{ github.event.inputs.force }}"
           DRY="${{ github.event.inputs.dry_run }}"
           DEBUG="${{ github.event.inputs.debug }}"
@@ -123,6 +128,7 @@ jobs:
             MAX_SCAN="2000"
             RETRY_ERRORS="true"
             COOLDOWN_HOURS="24"
+            FILTERS_JSON=""
             FORCE="false"
             DRY="false"
             DEBUG="false"
@@ -130,6 +136,7 @@ jobs:
 
           ARGS=(--budget "$BUDGET" --page-size "$PAGE_SIZE" --max-scan "$MAX_SCAN" --cooldown-hours "$COOLDOWN_HOURS")
           if [[ -n "${RID}" ]]; then ARGS+=(--record-id "$RID"); fi
+          if [[ -n "${FILTERS_JSON}" ]]; then ARGS+=(--filters-json "$FILTERS_JSON"); fi
           if [[ "${RETRY_ERRORS}" == "true" ]]; then ARGS+=(--retry-errors); fi
           if [[ "${FORCE}" == "true" ]]; then ARGS+=(--force); fi
           if [[ "${DRY}" == "true" ]]; then ARGS+=(--dry-run); fi
