@@ -41,6 +41,16 @@ def request_json(
             if not resp.content:
                 return None
             return resp.json()
+        except requests.HTTPError as exc:
+            # Make Actions logs self-contained: show response status/url and a small body snippet.
+            resp = exc.response
+            if resp is not None:
+                try:
+                    snippet = (resp.text or "").replace("\r", " ").replace("\n", " ")[:800]
+                except Exception:
+                    snippet = "<unavailable>"
+                raise RuntimeError(f"HTTP {resp.status_code} for {resp.url}; body={snippet!r}") from exc
+            raise
         except (requests.RequestException, ValueError) as exc:
             last_exc = exc
             if attempt < retries - 1:
