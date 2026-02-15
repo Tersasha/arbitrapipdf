@@ -152,9 +152,29 @@ def list_records(
     *,
     limit: int,
     offset: int,
+    view_id: str = "",
+    search_text: str = "",
+    sort_field: str = "",
+    sort_type: str = "",
+    filters_json: str = "",
+    fields_json: str = "",
 ) -> List[Dict[str, Any]]:
     url = f"{base_url}/api/v1/catalogs/{catalog_id}/records"
-    data = request_json(session, "GET", url, headers=headers, params={"limit": str(limit), "offset": str(offset)})
+    params: Dict[str, str] = {"limit": str(limit), "offset": str(offset)}
+    if view_id:
+        params["viewId"] = str(view_id)
+    if search_text:
+        params["searchText"] = str(search_text)
+    if sort_field:
+        params["sortField"] = str(sort_field)
+    if sort_type:
+        params["sortType"] = str(sort_type)
+    if filters_json:
+        params["filters"] = str(filters_json)
+    if fields_json:
+        params["fields"] = str(fields_json)
+
+    data = request_json(session, "GET", url, headers=headers, params=params)
     if not isinstance(data, list):
         raise RuntimeError(f"Unexpected records list type: {type(data)}")
     return [x for x in data if isinstance(x, dict)]
@@ -193,6 +213,20 @@ def main() -> int:
     ap.add_argument("--budget", type=int, default=1, help="Max parser-api calls per run (default 1)")
     ap.add_argument("--page-size", type=int, default=100, help="How many Bpium records to fetch per page (default 100)")
     ap.add_argument("--max-scan", type=int, default=2000, help="Max records to scan per run (default 2000)")
+    ap.add_argument("--view-id", default="", help="Bpium viewId (optional; see docs.bpium.ru Records)")
+    ap.add_argument("--search-text", default="", help="Bpium searchText (optional)")
+    ap.add_argument("--sort-field", default="id", help="Bpium sortField (default: id)")
+    ap.add_argument("--sort-type", default="-1", help="Bpium sortType (1 asc, -1 desc; default: -1)")
+    ap.add_argument(
+        "--filters-json",
+        default="",
+        help='Bpium filters JSON (string). If empty in scan mode, a safe default is used to only scan records with PdfUrl containing "kad.arbitr.ru".',
+    )
+    ap.add_argument(
+        "--fields-json",
+        default="",
+        help="Bpium fields JSON array (string). If empty, worker requests only the needed field ids.",
+    )
     ap.add_argument(
         "--retry-errors",
         action="store_true",
@@ -230,6 +264,25 @@ def main() -> int:
     fid_pdf_text_fetched_at = os.getenv("BPIUM_FIELD_PDF_TEXT_FETCHED_AT") or "20"
     fid_pdf_text_status = os.getenv("BPIUM_FIELD_PDF_TEXT_STATUS") or "21"
     fid_pdf_text_error = os.getenv("BPIUM_FIELD_PDF_TEXT_ERROR") or "22"
+
+    # Scan query options (can be overridden via env to avoid editing workflow inputs).
+    scan_view_id = os.getenv("BPIUM_VIEW_ID") or str(args.view_id or "")
+    scan_search_text = os.getenv("BPIUM_SEARCH_TEXT") or str(args.search_text or "")
+    scan_sort_field = os.getenv("BPIUM_SORT_FIELD") or str(args.sort_field or "")
+    scan_sort_type = os.getenv("BPIUM_SORT_TYPE") or str(args.sort_type or "")
+    scan_filters_json = os.getenv("BPIUM_FILTERS_JSON") or str(args.filters_json or "")
+    scan_fields_json = os.getenv("BPIUM_FIELDS_JSON") or str(args.fields_json or "")
+
+    if not scan_fields_json:
+        # Reduce payload size: only ask for fields we need in should_process/process_record.
+        scan_fields_json = json.dumps(
+            [str(fid_pdf_url), str(fid_pdf_text), str(fid_pdf_text_fetched_at), str(fid_pdf_text_status), str(fid_pdf_text_error)]
+        )
+
+    if not scan_filters_json and not args.record_id:
+        # Default filter for this project: only records that have PdfUrl pointing to kad.arbitr.ru.
+        # This prevents wasting scan budget on records without PDFs.
+        scan_filters_json = json.dumps({str(fid_pdf_url): "kad.arbitr.ru"})
 
     headers = {
         "Authorization": build_auth_header(login, password),
@@ -335,7 +388,20 @@ def main() -> int:
         # Note: budget controls *parser-api* calls (processing), not Bpium scanning.
         # This allows running with --budget 0 to "scan-only" (no parser-api calls), useful for debugging.
         while scanned < args.max_scan:
-            page = list_records(s, domain, headers, catalog_id, limit=args.page_size, offset=offset)
+            page = list_records(
+                s,
+                domain,
+                headers,
+                catalog_id,
+                limit=args.page_size,
+                offset=offset,
+                view_id=scan_view_id,
+                search_text=scan_search_text,
+                sort_field=scan_sort_field,
+                sort_type=scan_sort_type,
+                filters_json=scan_filters_json,
+                fields_json=scan_fields_json,
+            )
             if not page:
                 break
             pages_fetched += 1
@@ -372,6 +438,14 @@ def main() -> int:
             "emptyCount": empty_count,
             "errorCount": error_count,
             "pagesFetched": pages_fetched,
+            "scanQuery": {
+                "viewId": scan_view_id,
+                "searchText": scan_search_text,
+                "sortField": scan_sort_field,
+                "sortType": scan_sort_type,
+                "filters": scan_filters_json,
+                "fields": scan_fields_json,
+            },
             "dryRun": bool(args.dry_run),
         }
         if args.debug_skip_reasons:
