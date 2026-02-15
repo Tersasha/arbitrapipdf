@@ -161,12 +161,14 @@ def main() -> int:
         print("Missing env vars: BPIUM_DOMAIN, BPIUM_LOGIN, BPIUM_PASSWORD, PARSER_API_KEY", file=sys.stderr)
         return 2
 
-    catalog_id = os.getenv("BPIUM_CATALOG_ID", "45")
-    fid_pdf_url = os.getenv("BPIUM_FIELD_PDF_URL", "7")
-    fid_pdf_text = os.getenv("BPIUM_FIELD_PDF_TEXT", "19")
-    fid_pdf_text_fetched_at = os.getenv("BPIUM_FIELD_PDF_TEXT_FETCHED_AT", "20")
-    fid_pdf_text_status = os.getenv("BPIUM_FIELD_PDF_TEXT_STATUS", "21")
-    fid_pdf_text_error = os.getenv("BPIUM_FIELD_PDF_TEXT_ERROR", "22")
+    # GitHub Actions passes unset secrets as empty strings when mapped to env.
+    # Treat empty strings as "not set" and use defaults.
+    catalog_id = os.getenv("BPIUM_CATALOG_ID") or "45"
+    fid_pdf_url = os.getenv("BPIUM_FIELD_PDF_URL") or "7"
+    fid_pdf_text = os.getenv("BPIUM_FIELD_PDF_TEXT") or "19"
+    fid_pdf_text_fetched_at = os.getenv("BPIUM_FIELD_PDF_TEXT_FETCHED_AT") or "20"
+    fid_pdf_text_status = os.getenv("BPIUM_FIELD_PDF_TEXT_STATUS") or "21"
+    fid_pdf_text_error = os.getenv("BPIUM_FIELD_PDF_TEXT_ERROR") or "22"
 
     headers = {
         "Authorization": build_auth_header(login, password),
@@ -230,4 +232,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
