@@ -2,12 +2,14 @@ import argparse
 import base64
 import json
 import os
+import re
+import sys
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import requests
 
-from bpium_http import redact_sensitive, request_json
 from kad_stage_parser import parse_case_state, parse_instance_name, render_case_stage_for_field
 
 
@@ -54,22 +56,55 @@ def has_value(v: Any) -> bool:
     return True
 
 
-def is_meaningful_value(v: Any) -> bool:
-    """
-    Decide whether we should WRITE the extracted value into Bpium.
+def redact_secrets(text: str) -> str:
+    s = str(text or "")
+    # Redact parser-api key query param
+    s = re.sub(r"([?&]key=)[^&#\\s]+", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    # Redact basic/bearer auth if it ever appears
+    s = re.sub(r"(Authorization\\s*:\\s*)([^\\r\\n]+)", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    return s
 
-    We must not patch "empty" values into typed fields (e.g. date), because Bpium can reject them
-    with validation errors ("Invalid Date"). Also we avoid overwriting already-filled fields.
-    """
-    if v is None:
-        return False
-    if isinstance(v, str):
-        return bool(v.strip())
-    if isinstance(v, bool):
-        return True
-    if isinstance(v, (int, float)):
-        return True
-    return bool(str(v).strip())
+
+def request_json(
+    session: requests.Session,
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    *,
+    params: Optional[Dict[str, str]] = None,
+    json_body: Any = None,
+    timeout: int = 60,
+    retries: int = 2,
+    backoff: Iterable[int] = (1, 2),
+) -> Any:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp = session.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+            resp.raise_for_status()
+            if not resp.content:
+                return None
+            return resp.json()
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None:
+                try:
+                    snippet = (resp.text or "").replace("\\r", " ").replace("\\n", " ")[:800]
+                except Exception:
+                    snippet = "<unavailable>"
+                safe_url = redact_secrets(getattr(resp, "url", url))
+                raise RuntimeError(f"HTTP {resp.status_code} for {safe_url}; body={redact_secrets(snippet)!r}") from exc
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                delay = list(backoff)[attempt] if attempt < len(list(backoff)) else 2**attempt
+                time.sleep(delay)
+                continue
+            raise RuntimeError(redact_secrets(str(exc))) from exc
+    if last_exc:
+        raise RuntimeError(redact_secrets(str(last_exc))) from last_exc
+    raise RuntimeError("request failed without exception")
 
 
 def bpium_get_catalog_fields_map(session: requests.Session, base_url: str, headers: Dict[str, str], catalog_id: str) -> Dict[str, str]:
@@ -93,12 +128,15 @@ def bpium_list_records(
     offset: int,
     sort_field: str = "id",
     sort_type: str = "-1",
+    filters_json: str = "",
     fields_json: str = "",
 ) -> List[Dict[str, Any]]:
     url = f"{base_url}/api/v1/catalogs/{catalog_id}/records"
     params: Dict[str, str] = {"limit": str(limit), "offset": str(offset), "sortField": sort_field, "sortType": sort_type}
+    if filters_json:
+        params["filters"] = filters_json
     if fields_json:
-        params["fields"] = str(fields_json)
+        params["fields"] = fields_json
     data = request_json(session, "GET", url, headers=headers, params=params, timeout=60)
     if not isinstance(data, list):
         raise RuntimeError(f"Unexpected records list type: {type(data)}")
@@ -159,60 +197,167 @@ def short_list(items: List[Dict[str, Any]]) -> str:
         return ""
     if len(names) == 1:
         return names[0]
-    return f"{names[0]}; plus {len(names) - 1}"
+    return f"{names[0]}; \u0435\u0449\u0451 {len(names) - 1}"
+
+
+def _event_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("PublishDate", "Date"):
+        d = parse_dt(ev.get(key))
+        if d is not None:
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+    return None
+
+
+def _instance_num(inst: Dict[str, Any]) -> int:
+    try:
+        return int(inst.get("InstanceNumber") or 0)
+    except Exception:
+        return 0
+
+
+def _instance_stage(inst: Dict[str, Any]) -> str:
+    parsed = parse_instance_name(inst.get("Name"))
+    return str(parsed.get("stage") or "OTHER")
+
+
+def _instance_has_judges(inst: Dict[str, Any]) -> bool:
+    judges = [x for x in as_list(inst.get("Judges")) if isinstance(x, dict) and str(x.get("Name") or "").strip()]
+    return len(judges) > 0
+
+
+def _instance_is_finished(inst: Dict[str, Any]) -> bool:
+    file_obj = as_dict(inst.get("File"))
+    if str(file_obj.get("URL") or "").strip():
+        return True
+    for ev in as_list(inst.get("InstanceEvents")):
+        if not isinstance(ev, dict):
+            continue
+        finish_raw = ev.get("FinishEvent")
+        if finish_raw is True:
+            return True
+        if str(finish_raw).strip() in {"1", "true", "True"}:
+            return True
+    return False
+
+
+def _instance_best_dt(inst: Dict[str, Any], *, finished_only: bool = False) -> Optional[datetime]:
+    best: Optional[datetime] = None
+    for ev in as_list(inst.get("InstanceEvents")):
+        if not isinstance(ev, dict):
+            continue
+        if finished_only:
+            finish_raw = ev.get("FinishEvent")
+            is_final = finish_raw is True or str(finish_raw).strip() in {"1", "true", "True"}
+            if not is_final:
+                continue
+        d = _event_dt(ev)
+        if d is None:
+            continue
+        if best is None or d > best:
+            best = d
+    if best is not None:
+        return best
+    if finished_only:
+        file_obj = as_dict(inst.get("File"))
+        d = _event_dt(file_obj)
+        if d is not None:
+            return d
+    return None
+
+
+def _choose_instance_for_case(case: Dict[str, Any], active_stages: List[str], lifecycle: str) -> Optional[Dict[str, Any]]:
+    instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
+    if not instances:
+        return None
+
+    if lifecycle == "FINISHED":
+        best_inst: Optional[Dict[str, Any]] = None
+        best_dt: Optional[datetime] = None
+        for inst in instances:
+            d = _instance_best_dt(inst, finished_only=True)
+            if d is None:
+                continue
+            if best_dt is None or d > best_dt:
+                best_dt = d
+                best_inst = inst
+        if best_inst is not None:
+            return best_inst
+
+    stage_priority = {"CASSATION": 3, "APPEAL": 2, "FIRST": 1, "OTHER": 0}
+    target_stage = "OTHER"
+    if active_stages:
+        target_stage = sorted(
+            [str(s).upper() for s in active_stages],
+            key=lambda s: stage_priority.get(s, 0),
+            reverse=True,
+        )[0]
+
+    same_stage = [inst for inst in instances if _instance_stage(inst) == target_stage]
+    candidates = same_stage if same_stage else instances
+
+    def key_fn(inst: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        not_finished = 1 if not _instance_is_finished(inst) else 0
+        has_judges = 1 if _instance_has_judges(inst) else 0
+        d = _instance_best_dt(inst, finished_only=False)
+        ts = int(d.timestamp()) if d else 0
+        return (not_finished, has_judges, ts, _instance_num(inst))
+
+    chosen = sorted(candidates, key=key_fn, reverse=True)[0]
+    return chosen
+
+
+def _extract_finished(case: Dict[str, Any], state_field_value: str) -> bool:
+    if state_field_value == "FINISHED":
+        return True
+
+    case_finished_raw = case.get("Finished")
+    if case_finished_raw is True or str(case_finished_raw).strip() in {"1", "true", "True"}:
+        return True
+
+    instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
+    for inst in instances:
+        file_obj = as_dict(inst.get("File"))
+        if str(file_obj.get("URL") or "").strip():
+            return True
+        for ev in as_list(inst.get("InstanceEvents")):
+            if not isinstance(ev, dict):
+                continue
+            finish_raw = ev.get("FinishEvent")
+            if finish_raw is True or str(finish_raw).strip() in {"1", "true", "True"}:
+                return True
+    return False
 
 
 def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
     case = select_case_root(details)
-    case_state_raw = case.get("State")
-    case_state = parse_case_state(case_state_raw)
-    active_stages = set(case_state.get("activeStages") or [])
 
     plaintiffs = [x for x in as_list(case.get("Plaintiffs")) if isinstance(x, dict)]
     respondents = [x for x in as_list(case.get("Respondents")) if isinstance(x, dict)]
     thirds = [x for x in as_list(case.get("Thirds")) if isinstance(x, dict)]
 
+    state_raw = str(case.get("State") or "").strip()
+    parsed_state = parse_case_state(state_raw)
+    active_stages = [str(s).upper() for s in parsed_state.get("activeStages") or []]
+    lifecycle = str(parsed_state.get("lifecycle") or "UNKNOWN")
+    state_field_value = render_case_stage_for_field(parsed_state)
+
     instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
-    cur_inst = None
-    if instances:
-
-        def inst_num(x: Dict[str, Any]) -> int:
-            try:
-                return int(x.get("InstanceNumber") or 0)
-            except Exception:
-                return 0
-
-        def inst_finished(x: Dict[str, Any]) -> bool:
-            fv = x.get("FinishEvent")
-            if isinstance(fv, dict):
-                return len(fv) > 0
-            return bool(fv)
-
-        active_instances = [ins for ins in instances if not inst_finished(ins)] or list(instances)
-        if active_stages and "OTHER" not in active_stages:
-            matched = [ins for ins in active_instances if parse_instance_name(ins.get("Name")).get("stage") in active_stages]
-            if matched:
-                active_instances = matched
-        with_judges = [ins for ins in active_instances if any(isinstance(j, dict) for j in as_list(ins.get("Judges")))]
-        candidates = with_judges or active_instances
-        cur_inst = sorted(candidates, key=inst_num)[-1]
+    cur_inst = _choose_instance_for_case(case, active_stages, lifecycle)
 
     court = as_dict(cur_inst.get("Court")) if isinstance(cur_inst, dict) else {}
     judges = [x for x in as_list(cur_inst.get("Judges")) if isinstance(x, dict)] if isinstance(cur_inst, dict) else []
     if not judges:
-        for ins in instances:
-            j = [x for x in as_list(ins.get("Judges")) if isinstance(x, dict)]
-            if j:
-                judges = j
+        for inst in instances:
+            cand = [x for x in as_list(inst.get("Judges")) if isinstance(x, dict)]
+            if cand:
+                judges = cand
                 break
-
-    current_instance_stage = parse_instance_name(cur_inst.get("Name")).get("stage") if isinstance(cur_inst, dict) else "OTHER"
-    if current_instance_stage == "OTHER" and case_state.get("lifecycle") == "ACTIVE" and len(active_stages) == 1:
-        current_instance_stage = list(active_stages)[0]
 
     now = datetime.now(timezone.utc)
     hearings = [x for x in as_list(case.get("CourtHearings")) if isinstance(x, dict)]
-    future: List[Tuple[datetime, Dict[str, Any]]] = []
+    future = []
     for h in hearings:
         d = parse_dt(h.get("Start"))
         if d is None:
@@ -239,35 +384,35 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
         if v > max_sum:
             max_sum = v
 
-    def ev_dt(ev: Dict[str, Any]) -> Optional[datetime]:
-        for k in ("PublishDate", "Date"):
-            d = parse_dt(ev.get(k))
-            if d is not None:
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=timezone.utc)
-                return d
-        return None
-
     last_ev = None
     last_ev_dt = None
-    last_ev_with_file = None
-    last_ev_with_file_dt = None
     for ev in events:
-        d = ev_dt(ev)
+        d = _event_dt(ev)
         if d is None:
             continue
         if last_ev_dt is None or d > last_ev_dt:
             last_ev_dt = d
             last_ev = ev
-        if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http"):
-            if last_ev_with_file_dt is None or d > last_ev_with_file_dt:
-                last_ev_with_file_dt = d
-                last_ev_with_file = ev
 
     docs = [ev for ev in events if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http")]
     signed = [ev for ev in events if ev.get("HasSignature") is True]
 
+    last_ev_with_url = None
+    last_ev_url_dt = None
+    for ev in events:
+        file_url = str(ev.get("File") or "").strip()
+        if not file_url.lower().startswith("http"):
+            continue
+        d = _event_dt(ev)
+        if d is None:
+            continue
+        if last_ev_url_dt is None or d > last_ev_url_dt:
+            last_ev_url_dt = d
+            last_ev_with_url = ev
+
     out: Dict[str, Any] = {
+        "State": state_field_value,
+        "Finished": _extract_finished(case, state_field_value),
         "ClaimSumValue": max_sum if max_sum > 0 else None,
         "ClaimCurrency": "RUB" if max_sum > 0 else "",
         "PlaintiffsShort": short_list(plaintiffs),
@@ -275,8 +420,7 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
         "PlaintiffsCount": len(plaintiffs),
         "RespondentsCount": len(respondents),
         "ThirdsCount": len(thirds),
-        "CurrentInstance": str(current_instance_stage or ""),
-        "State": render_case_stage_for_field(case_state_raw),
+        "CurrentInstance": active_stages[0] if active_stages else (_instance_stage(cur_inst) if isinstance(cur_inst, dict) else "OTHER"),
         "CourtCode": str(court.get("Code") or "").strip(),
         "CourtName": str(court.get("Name") or "").strip(),
         "Judges": join_names(judges),
@@ -288,11 +432,7 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(last_ev, dict)
             else ""
         ).strip(" /"),
-        "LastEventUrl": (
-            str(last_ev_with_file.get("File") or "").strip()
-            if isinstance(last_ev_with_file, dict) and isinstance(last_ev_with_file.get("File"), str)
-            else ""
-        ),
+        "LastEventUrl": str(last_ev_with_url.get("File") or "").strip() if isinstance(last_ev_with_url, dict) and isinstance(last_ev_with_url.get("File"), str) else "",
         "DocsCount": len(docs),
         "SignedDocsCount": len(signed),
         "HasSignedDocs": True if len(signed) > 0 else False,
@@ -301,6 +441,34 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
         out.pop("ClaimSumValue", None)
     return out
 
+
+def needs_short_localization_fix(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    if not s:
+        return False
+    return "plus " in s or "; +" in s
+
+
+def should_patch_mvp_field(name: str, old_value: Any, new_value: Any, *, force: bool = False) -> bool:
+    if force:
+        return True
+    if not has_value(new_value):
+        return False
+    if not has_value(old_value):
+        return True
+
+    if name == "Finished":
+        old_bool = str(old_value).strip().lower() in {"1", "true", "yes", "y", "on"}
+        new_bool = str(new_value).strip().lower() in {"1", "true", "yes", "y", "on"}
+        if old_bool and not new_bool:
+            return False
+        return old_bool != new_bool
+
+    if name in {"State", "Finished"}:
+        return str(old_value).strip() != str(new_value).strip()
+    if name in {"PlaintiffsShort", "RespondentsShort"}:
+        return needs_short_localization_fix(old_value)
+    return False
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Backfill enriched MVP fields in catalog 45 from DetailsJson")
@@ -330,12 +498,15 @@ def main() -> int:
     with requests.Session() as s:
         name_to_id = bpium_get_catalog_fields_map(s, domain, headers, str(args.catalog_id))
 
+        # Required fields
         fid_details_json = name_to_id.get("DetailsJson")
         if not fid_details_json:
             print(json.dumps({"ok": False, "error": "DetailsJson field not found in catalog", "catalogId": args.catalog_id}))
             return 3
 
         mvp_names = [
+            "State",
+            "Finished",
             "ClaimSumValue",
             "ClaimCurrency",
             "PlaintiffsShort",
@@ -344,7 +515,6 @@ def main() -> int:
             "RespondentsCount",
             "ThirdsCount",
             "CurrentInstance",
-            "State",
             "CourtCode",
             "CourtName",
             "Judges",
@@ -395,18 +565,6 @@ def main() -> int:
                     skipped += 1
                     continue
 
-                need = args.force
-                if not need:
-                    for name, fid in mvp_ids.items():
-                        if not fid or name in {"EnrichAt", "EnrichStatus", "EnrichError"}:
-                            continue
-                        if not has_value(get_value(vals, str(fid))):
-                            need = True
-                            break
-                if not need:
-                    skipped += 1
-                    continue
-
                 try:
                     details = json.loads(str(raw_details))
                     if not isinstance(details, dict):
@@ -415,15 +573,21 @@ def main() -> int:
                 except Exception as exc:
                     errors += 1
                     if args.debug:
-                        print(json.dumps({"recordId": rid, "status": "error", "error": redact_sensitive(str(exc))}, ensure_ascii=False))
+                        print(json.dumps({"recordId": rid, "status": "error", "error": redact_secrets(str(exc))}, ensure_ascii=False))
+                    # store enrich error if fields exist
                     if mvp_ids.get("EnrichStatus") and mvp_ids.get("EnrichError") and not args.dry_run and rid:
-                        patch_err: Dict[str, Any] = {
-                            str(mvp_ids["EnrichStatus"]): "error",
-                            str(mvp_ids["EnrichError"]): redact_sensitive(str(exc))[:2000],
-                        }
-                        if mvp_ids.get("EnrichAt"):
-                            patch_err[str(mvp_ids["EnrichAt"])] = iso_utc_now()
-                        bpium_patch_record_values(s, domain, headers, str(args.catalog_id), rid, patch_err)
+                        bpium_patch_record_values(
+                            s,
+                            domain,
+                            headers,
+                            str(args.catalog_id),
+                            rid,
+                            {
+                                str(mvp_ids["EnrichStatus"]): "error",
+                                str(mvp_ids["EnrichError"]): redact_secrets(str(exc))[:2000],
+                                str(mvp_ids.get("EnrichAt") or ""): iso_utc_now() if mvp_ids.get("EnrichAt") else "",
+                            },
+                        )
                     continue
 
                 patch: Dict[str, Any] = {}
@@ -431,17 +595,16 @@ def main() -> int:
                     fid = mvp_ids.get(name)
                     if not fid:
                         continue
-                    if not is_meaningful_value(value):
-                        continue
-                    if args.force or not has_value(get_value(vals, str(fid))):
+                    old_value = get_value(vals, str(fid))
+                    if should_patch_mvp_field(name, old_value, value, force=bool(args.force)):
                         patch[str(fid)] = value
 
                 # enrich meta
-                if mvp_ids.get("EnrichAt") and (args.force or not has_value(get_value(vals, str(mvp_ids["EnrichAt"])))):
+                if mvp_ids.get("EnrichAt") and (patch or args.force):
                     patch[str(mvp_ids["EnrichAt"])] = iso_utc_now()
-                if mvp_ids.get("EnrichStatus") and (args.force or not has_value(get_value(vals, str(mvp_ids["EnrichStatus"])))):
-                    patch[str(mvp_ids["EnrichStatus"])] = "ok" if patch else "skip"
-                if mvp_ids.get("EnrichError") and (args.force or not has_value(get_value(vals, str(mvp_ids["EnrichError"])))):
+                if mvp_ids.get("EnrichStatus") and (patch or args.force):
+                    patch[str(mvp_ids["EnrichStatus"])] = "ok"
+                if mvp_ids.get("EnrichError") and (patch or args.force):
                     patch[str(mvp_ids["EnrichError"])] = ""
 
                 if not patch:
@@ -450,21 +613,8 @@ def main() -> int:
 
                 processed += 1
                 if not args.dry_run and rid:
-                    try:
-                        bpium_patch_record_values(s, domain, headers, str(args.catalog_id), rid, patch)
-                        updated += 1
-                    except Exception as exc:
-                        errors += 1
-                        if args.debug:
-                            print(
-                                json.dumps(
-                                    {"recordId": rid, "status": "error", "error": redact_sensitive(str(exc))},
-                                    ensure_ascii=False,
-                                )
-                            )
-                        continue
-                else:
-                    updated += 1
+                    bpium_patch_record_values(s, domain, headers, str(args.catalog_id), rid, patch)
+                updated += 1
                 if args.debug:
                     print(json.dumps({"recordId": rid, "status": "updated", "keys": list(patch.keys())}, ensure_ascii=False))
 

@@ -298,6 +298,8 @@ def main() -> int:
             nonlocal api_calls, processed, ok_count, empty_count, error_count
 
             pdf_url = str(get_value(vals, fid_pdf_url) or "").strip()
+            existing_text = str(get_value(vals, fid_pdf_text) or "").strip()
+            existing_status = str(get_value(vals, fid_pdf_text_status) or "").strip().lower()
 
             if args.budget < 1:
                 return {"ok": False, "reason": "budget_lt_1"}
@@ -325,11 +327,18 @@ def main() -> int:
 
             now = iso_utc_now()
             out_vals: Dict[str, Any] = {
-                str(fid_pdf_text_status): status,
                 str(fid_pdf_text_fetched_at): now,
                 str(fid_pdf_text_error): payload if status == "error" else "",
-                str(fid_pdf_text): payload if status == "ok" else "",
             }
+            if status == "ok" and payload:
+                out_vals[str(fid_pdf_text_status)] = "ok"
+                out_vals[str(fid_pdf_text)] = payload
+            else:
+                # Do not erase previously successful PdfText on transient errors.
+                if not existing_text:
+                    out_vals[str(fid_pdf_text_status)] = status
+                elif existing_status != "ok":
+                    out_vals[str(fid_pdf_text_status)] = status
 
             if not args.dry_run:
                 patch_record_values(s, domain, headers, catalog_id, str(record_id), out_vals)

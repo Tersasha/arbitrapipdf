@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 from pypdf import PdfReader
 
-from bpium_http import redact_sensitive, request_json
 from kad_stage_parser import parse_case_state, parse_instance_name, render_case_stage_for_field
 
 
@@ -22,6 +21,19 @@ PARSER_API_BASE = "https://parser-api.com/parser/arbitr_api"
 
 def iso_utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def redact_secrets(text: str) -> str:
+    s = str(text or "")
+    # Redact parser-api key query param
+    s = re.sub(r"([?&]key=)[^&#\\s]+", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    # Redact auth header if it ever appears
+    s = re.sub(r"(Authorization\\s*:\\s*)([^\\r\\n]+)", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    return s
+
+
+def safe_url(url: str) -> str:
+    return redact_secrets(url)
 
 
 def build_auth_header(login: str, password: str) -> str:
@@ -62,6 +74,47 @@ def has_value(v: Any) -> bool:
     if isinstance(v, dict):
         return len(v) > 0
     return True
+
+
+def needs_short_localization_fix(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    if not s:
+        return False
+    return "plus " in s or "; +" in s
+
+
+def should_patch_mvp_field(name: str, old_value: Any, new_value: Any, *, force: bool = False) -> bool:
+    if force:
+        return True
+    if not has_value(new_value):
+        return False
+    if not has_value(old_value):
+        return True
+
+    if name == "Finished":
+        old_bool = is_truthy(old_value)
+        new_bool = is_truthy(new_value)
+        if old_bool and not new_bool:
+            return False
+        return old_bool != new_bool
+
+    if name in {"State", "Finished"}:
+        return str(old_value).strip() != str(new_value).strip()
+    if name in {"PlaintiffsShort", "RespondentsShort"}:
+        return needs_short_localization_fix(old_value)
+    return False
+
+
+def build_mvp_patch(existing_values: Dict[str, Any], mvp_ids: Dict[str, str], mvp: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
+    patch: Dict[str, Any] = {}
+    for name, value in mvp.items():
+        fid = mvp_ids.get(name)
+        if not fid:
+            continue
+        old_value = get_value(existing_values, fid)
+        if should_patch_mvp_field(name, old_value, value, force=force):
+            patch[fid] = value
+    return patch
 
 
 def is_truthy(v: Any) -> bool:
@@ -161,7 +214,7 @@ def short_list_by_name(items: List[Dict[str, Any]]) -> str:
         return ""
     if len(names) == 1:
         return names[0]
-    return f"{names[0]}; plus {len(names) - 1}"
+    return f"{names[0]}; \u0435\u0449\u0451 {len(names) - 1}"
 
 
 def join_names(items: List[Dict[str, Any]]) -> str:
@@ -173,53 +226,160 @@ def join_names(items: List[Dict[str, Any]]) -> str:
     return "; ".join(out)
 
 
+def _event_dt(ev: Dict[str, Any]) -> Optional[datetime]:
+    for key in ("PublishDate", "Date"):
+        d = parse_iso_dt(ev.get(key))
+        if d is not None:
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            return d
+    return None
+
+
+def _instance_num(inst: Dict[str, Any]) -> int:
+    try:
+        return int(inst.get("InstanceNumber") or 0)
+    except Exception:
+        return 0
+
+
+def _instance_stage(inst: Dict[str, Any]) -> str:
+    parsed = parse_instance_name(inst.get("Name"))
+    return str(parsed.get("stage") or "OTHER")
+
+
+def _instance_has_judges(inst: Dict[str, Any]) -> bool:
+    judges = [x for x in as_list(inst.get("Judges")) if isinstance(x, dict) and str(x.get("Name") or "").strip()]
+    return len(judges) > 0
+
+
+def _instance_is_finished(inst: Dict[str, Any]) -> bool:
+    file_obj = as_dict(inst.get("File"))
+    if str(file_obj.get("URL") or "").strip():
+        return True
+    for ev in as_list(inst.get("InstanceEvents")):
+        if not isinstance(ev, dict):
+            continue
+        finish_raw = ev.get("FinishEvent")
+        if finish_raw is True:
+            return True
+        if str(finish_raw).strip() in {"1", "true", "True"}:
+            return True
+    return False
+
+
+def _instance_best_dt(inst: Dict[str, Any], *, finished_only: bool = False) -> Optional[datetime]:
+    best: Optional[datetime] = None
+    for ev in as_list(inst.get("InstanceEvents")):
+        if not isinstance(ev, dict):
+            continue
+        if finished_only:
+            finish_raw = ev.get("FinishEvent")
+            is_final = finish_raw is True or str(finish_raw).strip() in {"1", "true", "True"}
+            if not is_final:
+                continue
+        d = _event_dt(ev)
+        if d is None:
+            continue
+        if best is None or d > best:
+            best = d
+    if best is not None:
+        return best
+    if finished_only:
+        file_obj = as_dict(inst.get("File"))
+        d = _event_dt(file_obj)
+        if d is not None:
+            return d
+    return None
+
+
+def _choose_instance_for_case(case: Dict[str, Any], active_stages: List[str], lifecycle: str) -> Optional[Dict[str, Any]]:
+    instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
+    if not instances:
+        return None
+
+    if lifecycle == "FINISHED":
+        best_inst: Optional[Dict[str, Any]] = None
+        best_dt: Optional[datetime] = None
+        for inst in instances:
+            d = _instance_best_dt(inst, finished_only=True)
+            if d is None:
+                continue
+            if best_dt is None or d > best_dt:
+                best_dt = d
+                best_inst = inst
+        if best_inst is not None:
+            return best_inst
+
+    stage_priority = {"CASSATION": 3, "APPEAL": 2, "FIRST": 1, "OTHER": 0}
+    target_stage = "OTHER"
+    if active_stages:
+        target_stage = sorted(
+            [str(s).upper() for s in active_stages],
+            key=lambda s: stage_priority.get(s, 0),
+            reverse=True,
+        )[0]
+
+    same_stage = [inst for inst in instances if _instance_stage(inst) == target_stage]
+    candidates = same_stage if same_stage else instances
+
+    def key_fn(inst: Dict[str, Any]) -> Tuple[int, int, int, int]:
+        not_finished = 1 if not _instance_is_finished(inst) else 0
+        has_judges = 1 if _instance_has_judges(inst) else 0
+        d = _instance_best_dt(inst, finished_only=False)
+        ts = int(d.timestamp()) if d else 0
+        return (not_finished, has_judges, ts, _instance_num(inst))
+
+    chosen = sorted(candidates, key=key_fn, reverse=True)[0]
+    return chosen
+
+
+def _extract_finished(case: Dict[str, Any], state_field_value: str) -> bool:
+    if state_field_value == "FINISHED":
+        return True
+
+    case_finished_raw = case.get("Finished")
+    if case_finished_raw is True or str(case_finished_raw).strip() in {"1", "true", "True"}:
+        return True
+
+    instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
+    for inst in instances:
+        file_obj = as_dict(inst.get("File"))
+        if str(file_obj.get("URL") or "").strip():
+            return True
+        for ev in as_list(inst.get("InstanceEvents")):
+            if not isinstance(ev, dict):
+                continue
+            finish_raw = ev.get("FinishEvent")
+            if finish_raw is True or str(finish_raw).strip() in {"1", "true", "True"}:
+                return True
+    return False
+
+
 def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
     case = select_case_root(details)
-    case_state_raw = case.get("State")
-    case_state = parse_case_state(case_state_raw)
-    active_stages = set(case_state.get("activeStages") or [])
 
     plaintiffs = [x for x in as_list(case.get("Plaintiffs")) if isinstance(x, dict)]
     respondents = [x for x in as_list(case.get("Respondents")) if isinstance(x, dict)]
     thirds = [x for x in as_list(case.get("Thirds")) if isinstance(x, dict)]
 
+    state_raw = str(case.get("State") or "").strip()
+    parsed_state = parse_case_state(state_raw)
+    active_stages = [str(s).upper() for s in parsed_state.get("activeStages") or []]
+    lifecycle = str(parsed_state.get("lifecycle") or "UNKNOWN")
+    state_field_value = render_case_stage_for_field(parsed_state)
+
     instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
-    cur_inst: Optional[Dict[str, Any]] = None
-    if instances:
-
-        def inst_num(x: Dict[str, Any]) -> int:
-            try:
-                return int(x.get("InstanceNumber") or 0)
-            except Exception:
-                return 0
-
-        def inst_finished(x: Dict[str, Any]) -> bool:
-            fv = x.get("FinishEvent")
-            if isinstance(fv, dict):
-                return len(fv) > 0
-            return bool(fv)
-
-        active_instances = [ins for ins in instances if not inst_finished(ins)] or list(instances)
-        if active_stages and "OTHER" not in active_stages:
-            matched = [ins for ins in active_instances if parse_instance_name(ins.get("Name")).get("stage") in active_stages]
-            if matched:
-                active_instances = matched
-        with_judges = [ins for ins in active_instances if any(isinstance(j, dict) for j in as_list(ins.get("Judges")))]
-        candidates = with_judges or active_instances
-        cur_inst = sorted(candidates, key=inst_num)[-1]
+    cur_inst = _choose_instance_for_case(case, active_stages, lifecycle)
 
     court = as_dict(cur_inst.get("Court")) if isinstance(cur_inst, dict) else {}
     judges = [x for x in as_list(cur_inst.get("Judges")) if isinstance(x, dict)] if isinstance(cur_inst, dict) else []
     if not judges:
-        for ins in instances:
-            j = [x for x in as_list(ins.get("Judges")) if isinstance(x, dict)]
-            if j:
-                judges = j
+        for inst in instances:
+            cand = [x for x in as_list(inst.get("Judges")) if isinstance(x, dict)]
+            if cand:
+                judges = cand
                 break
-
-    current_instance_stage = parse_instance_name(cur_inst.get("Name")).get("stage") if isinstance(cur_inst, dict) else "OTHER"
-    if current_instance_stage == "OTHER" and case_state.get("lifecycle") == "ACTIVE" and len(active_stages) == 1:
-        current_instance_stage = list(active_stages)[0]
 
     now = datetime.now(timezone.utc)
     hearings = [x for x in as_list(case.get("CourtHearings")) if isinstance(x, dict)]
@@ -250,33 +410,31 @@ def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
         if v > max_sum:
             max_sum = v
 
-    def ev_dt(ev: Dict[str, Any]) -> Optional[datetime]:
-        for k in ("PublishDate", "Date"):
-            d = parse_iso_dt(ev.get(k))
-            if d is not None:
-                if d.tzinfo is None:
-                    d = d.replace(tzinfo=timezone.utc)
-                return d
-        return None
-
     last_ev: Optional[Dict[str, Any]] = None
     last_ev_dt: Optional[datetime] = None
-    last_ev_with_file: Optional[Dict[str, Any]] = None
-    last_ev_with_file_dt: Optional[datetime] = None
     for ev in events:
-        d = ev_dt(ev)
+        d = _event_dt(ev)
         if d is None:
             continue
         if last_ev_dt is None or d > last_ev_dt:
             last_ev_dt = d
             last_ev = ev
-        if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http"):
-            if last_ev_with_file_dt is None or d > last_ev_with_file_dt:
-                last_ev_with_file_dt = d
-                last_ev_with_file = ev
 
     docs = [ev for ev in events if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http")]
     signed = [ev for ev in events if ev.get("HasSignature") is True]
+
+    last_ev_with_url: Optional[Dict[str, Any]] = None
+    last_ev_url_dt: Optional[datetime] = None
+    for ev in events:
+        file_url = str(ev.get("File") or "").strip()
+        if not file_url.lower().startswith("http"):
+            continue
+        d = _event_dt(ev)
+        if d is None:
+            continue
+        if last_ev_url_dt is None or d > last_ev_url_dt:
+            last_ev_url_dt = d
+            last_ev_with_url = ev
 
     out: Dict[str, Any] = {
         "ClaimSumValue": max_sum if max_sum > 0 else None,
@@ -286,8 +444,9 @@ def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
         "PlaintiffsCount": len(plaintiffs),
         "RespondentsCount": len(respondents),
         "ThirdsCount": len(thirds),
-        "CurrentInstance": str(current_instance_stage or ""),
-        "State": render_case_stage_for_field(case_state_raw),
+        "CurrentInstance": active_stages[0] if active_stages else (_instance_stage(cur_inst) if isinstance(cur_inst, dict) else "OTHER"),
+        "State": state_field_value,
+        "Finished": _extract_finished(case, state_field_value),
         "CourtCode": str(court.get("Code") or "").strip(),
         "CourtName": str(court.get("Name") or "").strip(),
         "Judges": join_names(judges),
@@ -300,8 +459,8 @@ def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
             else ""
         ).strip(" /"),
         "LastEventUrl": (
-            str(last_ev_with_file.get("File") or "").strip()
-            if isinstance(last_ev_with_file, dict) and isinstance(last_ev_with_file.get("File"), str)
+            str(last_ev_with_url.get("File") or "").strip()
+            if isinstance(last_ev_with_url, dict) and isinstance(last_ev_with_url.get("File"), str)
             else ""
         ),
         "DocsCount": len(docs),
@@ -312,10 +471,59 @@ def extract_mvp_from_details(details: Dict[str, Any]) -> Dict[str, Any]:
         out.pop("ClaimSumValue", None)
     return out
 
+def request_json(
+    session: requests.Session,
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    *,
+    params: Optional[Dict[str, str]] = None,
+    json_body: Any = None,
+    timeout: int = 60,
+    retries: int = 2,
+    backoff: Tuple[int, ...] = (1, 2),
+) -> Any:
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp = session.request(method, url, headers=headers, params=params, json=json_body, timeout=timeout)
+            resp.raise_for_status()
+            if not resp.content:
+                return None
+            return resp.json()
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None:
+                try:
+                    snippet = (resp.text or "").replace("\r", " ").replace("\n", " ")[:800]
+                except Exception:
+                    snippet = "<unavailable>"
+                raise RuntimeError(
+                    f"HTTP {resp.status_code} for {safe_url(getattr(resp, 'url', url))}; body={redact_secrets(snippet)!r}"
+                ) from exc
+            raise
+        except (requests.RequestException, ValueError) as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(backoff[attempt] if attempt < len(backoff) else 2**attempt)
+                continue
+            raise RuntimeError(redact_secrets(str(exc))) from exc
+    if last_exc:
+        raise RuntimeError(redact_secrets(str(last_exc))) from last_exc
+    raise RuntimeError("request failed without exception")
 
-#
-# request_json is imported from bpium_http to avoid leaking secrets in URL/headers.
-#
+
+def bpium_get_catalog_fields_map(
+    session: requests.Session, base_url: str, headers: Dict[str, str], catalog_id: str
+) -> Dict[str, str]:
+    data = request_json(session, "GET", f"{base_url}/api/v1/catalogs/{catalog_id}", headers=headers, timeout=60)
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for f in data.get("fields") or []:
+        if isinstance(f, dict) and f.get("id") is not None:
+            out[str(f.get("name", "")).strip()] = str(f.get("id"))
+    return out
 
 
 def bpium_list_records(
@@ -394,22 +602,6 @@ def bpium_create_record(
     if not isinstance(data, dict):
         raise RuntimeError(f"Unexpected create record response: {type(data)}")
     return data
-
-
-def bpium_get_catalog_fields_map(
-    session: requests.Session,
-    base_url: str,
-    headers: Dict[str, str],
-    catalog_id: str,
-) -> Dict[str, str]:
-    data = request_json(session, "GET", f"{base_url}/api/v1/catalogs/{catalog_id}", headers=headers, timeout=60)
-    if not isinstance(data, dict):
-        return {}
-    out: Dict[str, str] = {}
-    for f in data.get("fields") or []:
-        if isinstance(f, dict) and f.get("id") is not None:
-            out[str(f.get("name", "")).strip()] = str(f.get("id"))
-    return out
 
 
 def parser_api_search(
@@ -746,7 +938,6 @@ def main() -> int:
         "mode": "pipeline",
         "tracks": {"scanned": 0, "processed": 0},
         "apiCalls": 0,
-        "searchCalls": 0,
         "detailsCalls": 0,
         "pdfCalls": 0,
         "casesUpserted": 0,
@@ -761,9 +952,11 @@ def main() -> int:
     }
 
     with requests.Session() as s:
-        # Resolve enriched field ids by name. If fields are not added yet, enrichment is skipped.
+        # Resolve enriched field ids by name. If fields are not added yet, enrichment is skipped silently.
         cat45_name_to_id = bpium_get_catalog_fields_map(s, domain, headers, cat_45)
         mvp_field_names = [
+            "State",
+            "Finished",
             "ClaimSumValue",
             "ClaimCurrency",
             "PlaintiffsShort",
@@ -772,7 +965,6 @@ def main() -> int:
             "RespondentsCount",
             "ThirdsCount",
             "CurrentInstance",
-            "State",
             "CourtCode",
             "CourtName",
             "Judges",
@@ -794,13 +986,9 @@ def main() -> int:
         if args.track_record_id:
             track_records = [bpium_get_record(s, domain, headers, cat_44, str(args.track_record_id))]
         else:
-            # Fair selection: pick records that were synced least recently (LastReqAt/LastSyncAt),
-            # not the newest record by id. This prevents "new INN starvation" when max_tracks_per_run=1.
-            candidates: List[Dict[str, Any]] = []
             offset = 0
             page_size = 200
-            max_scan = 5000
-            while tracks_scanned < max_scan:
+            while len(track_records) < int(args.max_tracks_per_run):
                 page = bpium_list_records(
                     s,
                     domain,
@@ -810,16 +998,7 @@ def main() -> int:
                     offset=offset,
                     sort_field="id",
                     sort_type="-1",
-                    fields_json=json.dumps(
-                        [
-                            f44_inn,
-                            f44_sync_enabled,
-                            f44_last_req_log,
-                            f44_search_from,
-                            f44_last_req_at,
-                            f44_last_sync_at,
-                        ]
-                    ),
+                    fields_json=json.dumps([f44_inn, f44_sync_enabled, f44_last_req_log, f44_search_from]),
                 )
                 if not page:
                     break
@@ -831,25 +1010,10 @@ def main() -> int:
                     inn = digits_only(str(get_value(vals, f44_inn) or ""))
                     if len(inn) not in (10, 12):
                         continue
-                    candidates.append(rec)
+                    track_records.append(rec)
+                    if len(track_records) >= int(args.max_tracks_per_run):
+                        break
                 offset += page_size
-
-            def track_sort_key(rec: Dict[str, Any]) -> Tuple[str, int]:
-                vals = as_dict(rec.get("values"))
-                # Prefer LastReqAt; fallback to LastSyncAt; then by id.
-                dt = parse_iso_utc(str(get_value(vals, f44_last_req_at) or "")) or parse_iso_utc(
-                    str(get_value(vals, f44_last_sync_at) or "")
-                )
-                # Use a stable string key to avoid naive datetime comparisons if parsing fails.
-                dt_key = dt.strftime("%Y-%m-%dT%H:%M:%SZ") if dt is not None else "1970-01-01T00:00:00Z"
-                try:
-                    rid = int(str(rec.get("id") or "0"))
-                except Exception:
-                    rid = 0
-                return (dt_key, rid)
-
-            candidates.sort(key=track_sort_key)
-            track_records = candidates[: int(args.max_tracks_per_run)]
 
         out_summary["tracks"]["scanned"] = tracks_scanned
 
@@ -946,90 +1110,45 @@ def main() -> int:
 
                 pdf_url = str(get_value(vals45, fields_45["pdf_url"]) or "").strip()
                 pdf_text = str(get_value(vals45, fields_45["pdf_text"]) or "").strip()
+                pdf_status_existing = str(get_value(vals45, fields_45["pdf_text_status"]) or "").strip().lower()
                 details_json_existing = str(get_value(vals45, fields_45["details_json"]) or "").strip()
 
-                # Enrichment (MVP fields) is best-effort and "only empty": it must not overwrite existing values.
-                enrich_attempted = False
-                enrich_updated = False
-                enrich_failed = False
-
-                def is_blank(v: Any) -> bool:
-                    if v is None:
-                        return True
-                    if isinstance(v, str):
-                        return not v.strip()
-                    if isinstance(v, list):
-                        return len(v) == 0
-                    return False
-
-                fid_enrich_at = mvp_ids.get("EnrichAt")
-                fid_enrich_status = mvp_ids.get("EnrichStatus")
-                fid_enrich_error = mvp_ids.get("EnrichError")
-
-                def try_enrich_from_details(details_obj: Dict[str, Any], *, source_tag: str) -> None:
-                    nonlocal last_error, enrich_attempted, enrich_updated, enrich_failed
-
-                    if not mvp_ids:
-                        return
-                    if not rid45:
-                        return
-                    if args.dry_run:
-                        return
-
-                    enrich_attempted = True
+                # If we already have DetailsJson, try enriching MVP fields without extra parser-api calls.
+                if mvp_ids and details_json_existing and rid45:
                     try:
-                        mvp = extract_mvp_from_details(details_obj)
-                        patch_mvp: Dict[str, Any] = {}
-                        changed = 0
-                        for name, val in mvp.items():
-                             fid = mvp_ids.get(name)
-                             if not fid:
-                                 continue
-                             # Do not write empty strings / None into Bpium (typed fields like date reject them).
-                             if val is None:
-                                 continue
-                             if isinstance(val, str) and not val.strip():
-                                 continue
-                             if is_blank(get_value(vals45, fid)):
-                                 patch_mvp[fid] = val
-                                 changed += 1
+                        parsed = json.loads(details_json_existing)
+                        mvp = extract_mvp_from_details(parsed if isinstance(parsed, dict) else {})
+                        patch_mvp = build_mvp_patch(vals45, mvp_ids, mvp, force=False)
 
-                        cur_status = str(get_value(vals45, fid_enrich_status) or "").strip() if fid_enrich_status else ""
-                        status_should_update = (not cur_status) or (cur_status == "error")
+                        if patch_mvp:
+                            fid_at = mvp_ids.get("EnrichAt")
+                            fid_status = mvp_ids.get("EnrichStatus")
+                            fid_err = mvp_ids.get("EnrichError")
+                            if fid_at:
+                                patch_mvp[fid_at] = iso_utc_now()
+                            if fid_status:
+                                patch_mvp[fid_status] = "ok"
+                            if fid_err:
+                                patch_mvp[fid_err] = ""
 
-                        if changed > 0:
-                            enrich_updated = True
-                            if fid_enrich_status and status_should_update:
-                                patch_mvp[fid_enrich_status] = "ok"
-                            if fid_enrich_error and (status_should_update or is_blank(get_value(vals45, fid_enrich_error))):
-                                patch_mvp[fid_enrich_error] = ""
-                            if fid_enrich_at and (status_should_update or is_blank(get_value(vals45, fid_enrich_at))):
-                                patch_mvp[fid_enrich_at] = iso_utc_now()
-
-                            bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_mvp)
+                            if not args.dry_run:
+                                bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_mvp)
+                            out_summary["enrichOk"] += 1
                         else:
-                            # Nothing to fill (already has values). Do not touch meta fields to avoid churn.
-                            return
+                            out_summary["enrichSkip"] += 1
                     except Exception as exc:
-                        enrich_failed = True
-                        msg = redact_sensitive(f"enrich failed ({source_tag}) CaseId={case_id}: {exc}")
-                        last_error = msg
-                        if fid_enrich_status and (not str(get_value(vals45, fid_enrich_status) or "").strip()):
-                            patch_err: Dict[str, Any] = {fid_enrich_status: "error"}
-                            if fid_enrich_error:
-                                patch_err[fid_enrich_error] = msg
-                            if fid_enrich_at:
-                                patch_err[fid_enrich_at] = iso_utc_now()
+                        out_summary["enrichErr"] += 1
+                        last_error = f"enrich(from detailsJson) failed for CaseId={case_id}: {redact_secrets(str(exc))}"
+                        fid_status = mvp_ids.get("EnrichStatus")
+                        fid_err = mvp_ids.get("EnrichError")
+                        fid_at = mvp_ids.get("EnrichAt")
+                        if fid_status and fid_err and not args.dry_run:
+                            patch_err: Dict[str, Any] = {fid_status: "error", fid_err: redact_secrets(str(exc))[:2000]}
+                            if fid_at:
+                                patch_err[fid_at] = iso_utc_now()
                             bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_err)
 
-                # Fast path: enrich from already saved DetailsJson (no parser-api calls).
-                if details_json_existing and mvp_ids:
-                    try:
-                        try_enrich_from_details(json.loads(details_json_existing), source_tag="DetailsJson")
-                    except Exception:
-                        # json decode errors are handled inside try_enrich_from_details, but keep this extra guard.
-                        pass
-
+                # Fetch details if we do not have DetailsJson yet, or if PdfUrl is missing.
                 if (not details_json_existing or not pdf_url) and api_calls_total < int(args.max_parser_api_calls):
                     try:
                         api_calls_total += 1
@@ -1052,11 +1171,40 @@ def main() -> int:
                         if not args.dry_run and rid45:
                             bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch)
 
-                        # Enrich from fresh details response (does not spend extra parser-api calls).
+                        # Enrich MVP fields from details (Git-side parsing; Bpium stores flat fields).
                         if mvp_ids:
-                            try_enrich_from_details(details, source_tag="details_by_id")
+                            try:
+                                mvp = extract_mvp_from_details(details if isinstance(details, dict) else {})
+                                patch_mvp = build_mvp_patch(vals45, mvp_ids, mvp, force=False)
+
+                                if patch_mvp:
+                                    fid_at = mvp_ids.get("EnrichAt")
+                                    fid_status = mvp_ids.get("EnrichStatus")
+                                    fid_err = mvp_ids.get("EnrichError")
+                                    if fid_at:
+                                        patch_mvp[fid_at] = iso_utc_now()
+                                    if fid_status:
+                                        patch_mvp[fid_status] = "ok"
+                                    if fid_err:
+                                        patch_mvp[fid_err] = ""
+                                    if not args.dry_run and rid45:
+                                        bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_mvp)
+                                    out_summary["enrichOk"] += 1
+                                else:
+                                    out_summary["enrichSkip"] += 1
+                            except Exception as exc:
+                                out_summary["enrichErr"] += 1
+                                last_error = f"enrich failed for CaseId={case_id}: {redact_secrets(str(exc))}"
+                                fid_status = mvp_ids.get("EnrichStatus")
+                                fid_err = mvp_ids.get("EnrichError")
+                                fid_at = mvp_ids.get("EnrichAt")
+                                if fid_status and fid_err and not args.dry_run and rid45:
+                                    patch_err: Dict[str, Any] = {fid_status: "error", fid_err: redact_secrets(str(exc))[:2000]}
+                                    if fid_at:
+                                        patch_err[fid_at] = iso_utc_now()
+                                    bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch_err)
                     except Exception as exc:
-                        last_error = redact_sensitive(f"details_by_id failed for CaseId={case_id}: {exc}")
+                        last_error = f"details_by_id failed for CaseId={case_id}: {exc}"
 
                 if pdf_url and not pdf_text and api_calls_total < int(args.max_parser_api_calls):
                     try:
@@ -1072,7 +1220,6 @@ def main() -> int:
                             status, payload = extract_text_from_pdf_base64(b64)
                     except Exception as exc:
                         status, payload = "error", str(exc)
-                        payload = redact_sensitive(payload)
 
                     now = iso_utc_now()
                     if status == "ok":
@@ -1084,25 +1231,23 @@ def main() -> int:
                     else:
                         per_track_pdf_err += 1
                         out_summary["pdfErr"] += 1
-                        last_error = redact_sensitive(payload)
+                        last_error = payload
 
                     patch2: Dict[str, Any] = {
-                        fields_45["pdf_text_status"]: status,
                         fields_45["pdf_text_fetched_at"]: now,
                         fields_45["pdf_text_error"]: payload if status == "error" else "",
-                        fields_45["pdf_text"]: payload if status == "ok" else "",
                     }
+                    if status == "ok" and payload:
+                        patch2[fields_45["pdf_text_status"]] = "ok"
+                        patch2[fields_45["pdf_text"]] = payload
+                    else:
+                        # Never erase a previously successful PdfText on transient errors/empty responses.
+                        if not pdf_text:
+                            patch2[fields_45["pdf_text_status"]] = status
+                        elif pdf_status_existing != "ok":
+                            patch2[fields_45["pdf_text_status"]] = status
                     if not args.dry_run and rid45:
                         bpium_patch_record_values(s, domain, headers, cat_45, rid45, patch2)
-
-                # Finalize enrichment counters for this case (only once per case).
-                if mvp_ids and enrich_attempted:
-                    if enrich_failed:
-                        out_summary["enrichErr"] += 1
-                    elif enrich_updated:
-                        out_summary["enrichOk"] += 1
-                    else:
-                        out_summary["enrichSkip"] += 1
 
             backfill_done = False
 
@@ -1119,7 +1264,6 @@ def main() -> int:
                         api_calls_total += 1
                         per_track_api_calls += 1
                         out_summary["apiCalls"] += 1
-                        out_summary["searchCalls"] += 1
 
                         search = parser_api_search(
                             s,
@@ -1130,7 +1274,7 @@ def main() -> int:
                             date_to="",
                         )
                     except Exception as exc:
-                        last_error = redact_sensitive(f"search(backfill) failed: {exc}")
+                        last_error = f"search(backfill) failed: {exc}"
                         break
 
                     cases = as_list(search.get("Cases"))
@@ -1177,7 +1321,6 @@ def main() -> int:
                         api_calls_total += 1
                         per_track_api_calls += 1
                         out_summary["apiCalls"] += 1
-                        out_summary["searchCalls"] += 1
 
                         search = parser_api_search(
                             s,
@@ -1188,7 +1331,7 @@ def main() -> int:
                             date_to=dt_rolling,
                         )
                     except Exception as exc:
-                        last_error = redact_sensitive(f"search(rolling) failed: {exc}")
+                        last_error = f"search(rolling) failed: {exc}"
                         break
                     cases = as_list(search.get("Cases"))
                     pages_count = int(search.get("PagesCount") or 0)
@@ -1222,7 +1365,7 @@ def main() -> int:
                 "updatedAt": iso_utc_now(),
             }
             if last_error:
-                cursor["last"]["error"] = redact_sensitive(last_error)
+                cursor["last"]["error"] = last_error
 
             status = (
                 f"{cursor.get('mode')} api={per_track_api_calls} cases={per_track_cases_upserted} "
@@ -1244,7 +1387,7 @@ def main() -> int:
                         f44_last_req_count: str(per_track_api_calls),
                         f44_last_req_log: cursor_to_json(cursor),
                         f44_last_sync_status: status,
-                        f44_last_sync_error: redact_sensitive(last_error),
+                        f44_last_sync_error: last_error,
                     },
                 )
 

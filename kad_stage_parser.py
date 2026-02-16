@@ -1,57 +1,64 @@
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Set
 
 
-Stage = str  # FIRST | APPEAL | CASSATION | OTHER
+Stage = Literal["FIRST", "APPEAL", "CASSATION", "OTHER"]
+Lifecycle = Literal["ACTIVE", "FINISHED", "UNKNOWN"]
 
 
-def normalize_ru(s: Any) -> str:
-    str_v = ("" if s is None else str(s))
-    return (
-        str_v.strip()
-        .lower()
-        .replace("ё", "е")
-        .replace("–", "-")
-        .replace("—", "-")
-        .replace("\u00a0", " ")
-        .replace("\t", " ")
-    )
+RE_HAS_INSTANCE = re.compile(r"инстанц", re.IGNORECASE | re.UNICODE)
+RE_FIRST_WORD = re.compile(r"перв(ая|ой|ую|ые|ых|ым|ыми)", re.IGNORECASE | re.UNICODE)
+RE_FIRST_NUM = re.compile(r"(^|[^0-9a-zа-я])(1|i)\s*[-]?\s*я([^0-9a-zа-я]|$)", re.IGNORECASE | re.UNICODE)
+RE_APPEAL = re.compile(r"апелляц|апелляцион|апелл", re.IGNORECASE | re.UNICODE)
+RE_CASSATION = re.compile(r"кассац|кассацион", re.IGNORECASE | re.UNICODE)
+RE_FINISHED = re.compile(
+    r"рассмотрение дела завершено|дела завершено|дело завершено",
+    re.IGNORECASE | re.UNICODE,
+)
+RE_OTHER_HINT = re.compile(
+    r"надзор|верховн|вс рф|пересмотр|нов(ым|ыми) обстоятельств|вновь открывш",
+    re.IGNORECASE | re.UNICODE,
+)
+
+RE_INST_FIRST = re.compile(r"первая", re.IGNORECASE | re.UNICODE)
+RE_INST_APPEAL = re.compile(r"апелляцион|апелляц", re.IGNORECASE | re.UNICODE)
+RE_INST_CASSATION = re.compile(r"кассацион|кассац", re.IGNORECASE | re.UNICODE)
+RE_INST_OTHER = re.compile(r"надзор|верховн|пересмотр", re.IGNORECASE | re.UNICODE)
+
+STAGE_ORDER: Dict[Stage, int] = {"FIRST": 1, "APPEAL": 2, "CASSATION": 3, "OTHER": 0}
 
 
-def _collapse_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", s)
-
-
-RE_HAS_INSTANCE = re.compile(r"инстанц", re.IGNORECASE)
-RE_FIRST_WORD = re.compile(r"перв(ая|ой|ую|ые|ых|ым|ыми)", re.IGNORECASE)
-RE_FIRST_NUM = re.compile(r"(^|[^0-9a-zа-я])(1|i)\s*[-]?\s*я([^0-9a-zа-я]|$)", re.IGNORECASE)
-RE_APPEAL = re.compile(r"апелляц|апелляцион|апелл", re.IGNORECASE)
-RE_CASSATION = re.compile(r"кассац|кассацион", re.IGNORECASE)
-RE_FINISHED = re.compile(r"рассмотрение дела завершено|дела завершено|дело завершено", re.IGNORECASE)
-RE_OTHER_HINT = re.compile(r"надзор|верховн|вс рф|пересмотр|нов(ым|ыми) обстоятельств|вновь открывш", re.IGNORECASE)
-
-RE_INST_FIRST = re.compile(r"первая", re.IGNORECASE)
-RE_INST_APPEAL = re.compile(r"апелляцион|апелляц", re.IGNORECASE)
-RE_INST_CASSATION = re.compile(r"кассацион|кассац", re.IGNORECASE)
-RE_INST_OTHER = re.compile(r"надзор|верховн|пересмотр", re.IGNORECASE)
-
-
-def _ordered(stages_set: set) -> List[Stage]:
-    order = ["FIRST", "APPEAL", "CASSATION", "OTHER"]
-    return [s for s in order if s in stages_set]
+def normalize_ru(value: Any) -> str:
+    s = str(value or "")
+    s = s.strip().lower()
+    s = s.replace("ё", "е")
+    s = s.replace("–", "-").replace("—", "-")
+    s = re.sub(r"\s+", " ", s)
+    return s
 
 
 def parse_case_state(raw_state: Any) -> Dict[str, Any]:
-    normalized = _collapse_spaces(normalize_ru(raw_state))
+    normalized = normalize_ru(raw_state)
     raw = "" if raw_state is None else str(raw_state)
+
     if not normalized:
-        return {"lifecycle": "UNKNOWN", "activeStages": [], "raw": raw, "normalized": normalized}
+        return {
+            "lifecycle": "UNKNOWN",
+            "activeStages": [],
+            "raw": raw,
+            "normalized": normalized,
+        }
 
     if RE_FINISHED.search(normalized):
-        return {"lifecycle": "FINISHED", "activeStages": [], "raw": raw, "normalized": normalized}
+        return {
+            "lifecycle": "FINISHED",
+            "activeStages": [],
+            "raw": raw,
+            "normalized": normalized,
+        }
 
-    looks_like_instance = bool(RE_HAS_INSTANCE.search(normalized))
-    stages = set()
+    looks_like_instance_state = RE_HAS_INSTANCE.search(normalized) is not None
+    stages: Set[Stage] = set()
 
     if RE_APPEAL.search(normalized):
         stages.add("APPEAL")
@@ -61,18 +68,24 @@ def parse_case_state(raw_state: Any) -> Dict[str, Any]:
         stages.add("FIRST")
 
     if not stages:
-        # Even if we cannot parse a concrete stage, keep explicit OTHER for diagnostics/polling logic.
-        if (not looks_like_instance) or RE_OTHER_HINT.search(normalized):
+        if (not looks_like_instance_state) or RE_OTHER_HINT.search(normalized):
             stages.add("OTHER")
         else:
             stages.add("OTHER")
 
-    return {"lifecycle": "ACTIVE", "activeStages": _ordered(stages), "raw": raw, "normalized": normalized}
+    ordered = sorted(stages, key=lambda s: STAGE_ORDER.get(s, 0), reverse=True)
+    return {
+        "lifecycle": "ACTIVE",
+        "activeStages": ordered,
+        "raw": raw,
+        "normalized": normalized,
+    }
 
 
 def parse_instance_name(raw_name: Any) -> Dict[str, Any]:
-    normalized = _collapse_spaces(normalize_ru(raw_name))
+    normalized = normalize_ru(raw_name)
     raw = "" if raw_name is None else str(raw_name)
+
     if not normalized:
         return {"stage": "OTHER", "raw": raw, "normalized": normalized, "confidence": "LOW"}
     if RE_INST_APPEAL.search(normalized):
@@ -86,19 +99,21 @@ def parse_instance_name(raw_name: Any) -> Dict[str, Any]:
     return {"stage": "OTHER", "raw": raw, "normalized": normalized, "confidence": "LOW"}
 
 
-def render_case_stage_for_field(raw_state: Any) -> str:
-    """
-    Compact representation for Bpium text field:
-      FINISHED | UNKNOWN | FIRST | APPEAL | CASSATION | FIRST,APPEAL ...
-    """
-    parsed = parse_case_state(raw_state)
-    lc = parsed.get("lifecycle")
-    if lc == "FINISHED":
+def render_case_stage_for_field(parsed_case_state: Dict[str, Any]) -> str:
+    lifecycle = str(parsed_case_state.get("lifecycle") or "")
+    active = parsed_case_state.get("activeStages") or []
+
+    if lifecycle == "FINISHED":
         return "FINISHED"
-    if lc == "UNKNOWN":
-        return "UNKNOWN"
-    stages = parsed.get("activeStages") or []
-    if not stages:
-        return "UNKNOWN"
-    return ",".join(stages)
+    if lifecycle != "ACTIVE":
+        return "OTHER"
+    if not active:
+        return "OTHER"
+
+    uniq: List[str] = []
+    for s in active:
+        ss = str(s).upper().strip()
+        if ss and ss not in uniq:
+            uniq.append(ss)
+    return ",".join(uniq) if uniq else "OTHER"
 
