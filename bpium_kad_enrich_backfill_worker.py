@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from bpium_http import redact_sensitive, request_json
+from kad_stage_parser import parse_case_state, parse_instance_name, render_case_stage_for_field
 
 
 def iso_utc_now() -> str:
@@ -158,11 +159,14 @@ def short_list(items: List[Dict[str, Any]]) -> str:
         return ""
     if len(names) == 1:
         return names[0]
-    return f"{names[0]}; еще {len(names) - 1}"
+    return f"{names[0]}; plus {len(names) - 1}"
 
 
 def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
     case = select_case_root(details)
+    case_state_raw = case.get("State")
+    case_state = parse_case_state(case_state_raw)
+    active_stages = set(case_state.get("activeStages") or [])
 
     plaintiffs = [x for x in as_list(case.get("Plaintiffs")) if isinstance(x, dict)]
     respondents = [x for x in as_list(case.get("Respondents")) if isinstance(x, dict)]
@@ -171,15 +175,40 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
     instances = [x for x in as_list(case.get("CaseInstances")) if isinstance(x, dict)]
     cur_inst = None
     if instances:
+
         def inst_num(x: Dict[str, Any]) -> int:
             try:
                 return int(x.get("InstanceNumber") or 0)
             except Exception:
                 return 0
-        cur_inst = sorted(instances, key=inst_num)[-1]
+
+        def inst_finished(x: Dict[str, Any]) -> bool:
+            fv = x.get("FinishEvent")
+            if isinstance(fv, dict):
+                return len(fv) > 0
+            return bool(fv)
+
+        active_instances = [ins for ins in instances if not inst_finished(ins)] or list(instances)
+        if active_stages and "OTHER" not in active_stages:
+            matched = [ins for ins in active_instances if parse_instance_name(ins.get("Name")).get("stage") in active_stages]
+            if matched:
+                active_instances = matched
+        with_judges = [ins for ins in active_instances if any(isinstance(j, dict) for j in as_list(ins.get("Judges")))]
+        candidates = with_judges or active_instances
+        cur_inst = sorted(candidates, key=inst_num)[-1]
 
     court = as_dict(cur_inst.get("Court")) if isinstance(cur_inst, dict) else {}
     judges = [x for x in as_list(cur_inst.get("Judges")) if isinstance(x, dict)] if isinstance(cur_inst, dict) else []
+    if not judges:
+        for ins in instances:
+            j = [x for x in as_list(ins.get("Judges")) if isinstance(x, dict)]
+            if j:
+                judges = j
+                break
+
+    current_instance_stage = parse_instance_name(cur_inst.get("Name")).get("stage") if isinstance(cur_inst, dict) else "OTHER"
+    if current_instance_stage == "OTHER" and case_state.get("lifecycle") == "ACTIVE" and len(active_stages) == 1:
+        current_instance_stage = list(active_stages)[0]
 
     now = datetime.now(timezone.utc)
     hearings = [x for x in as_list(case.get("CourtHearings")) if isinstance(x, dict)]
@@ -221,6 +250,8 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
 
     last_ev = None
     last_ev_dt = None
+    last_ev_with_file = None
+    last_ev_with_file_dt = None
     for ev in events:
         d = ev_dt(ev)
         if d is None:
@@ -228,6 +259,10 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
         if last_ev_dt is None or d > last_ev_dt:
             last_ev_dt = d
             last_ev = ev
+        if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http"):
+            if last_ev_with_file_dt is None or d > last_ev_with_file_dt:
+                last_ev_with_file_dt = d
+                last_ev_with_file = ev
 
     docs = [ev for ev in events if isinstance(ev.get("File"), str) and str(ev.get("File") or "").strip().lower().startswith("http")]
     signed = [ev for ev in events if ev.get("HasSignature") is True]
@@ -240,7 +275,8 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
         "PlaintiffsCount": len(plaintiffs),
         "RespondentsCount": len(respondents),
         "ThirdsCount": len(thirds),
-        "CurrentInstance": str(cur_inst.get("Name") or "").strip() if isinstance(cur_inst, dict) else "",
+        "CurrentInstance": str(current_instance_stage or ""),
+        "State": render_case_stage_for_field(case_state_raw),
         "CourtCode": str(court.get("Code") or "").strip(),
         "CourtName": str(court.get("Name") or "").strip(),
         "Judges": join_names(judges),
@@ -252,7 +288,11 @@ def extract_mvp(details: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(last_ev, dict)
             else ""
         ).strip(" /"),
-        "LastEventUrl": str(last_ev.get("File") or "").strip() if isinstance(last_ev, dict) and isinstance(last_ev.get("File"), str) else "",
+        "LastEventUrl": (
+            str(last_ev_with_file.get("File") or "").strip()
+            if isinstance(last_ev_with_file, dict) and isinstance(last_ev_with_file.get("File"), str)
+            else ""
+        ),
         "DocsCount": len(docs),
         "SignedDocsCount": len(signed),
         "HasSignedDocs": True if len(signed) > 0 else False,
@@ -304,6 +344,7 @@ def main() -> int:
             "RespondentsCount",
             "ThirdsCount",
             "CurrentInstance",
+            "State",
             "CourtCode",
             "CourtName",
             "Judges",
