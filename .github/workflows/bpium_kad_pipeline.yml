@@ -100,7 +100,7 @@ jobs:
           import json, os
           p = "pipeline_out.json"
           with open(p, "r", encoding="utf-8") as f:
-            d = json.load(f)
+              d = json.load(f)
           api = int(d.get("apiCalls") or 0)
           search = int(d.get("searchCalls") or 0)
           details = int(d.get("detailsCalls") or 0)
@@ -113,11 +113,14 @@ jobs:
           enrich_skip = d.get("enrichSkip")
           enrich_err = d.get("enrichErr")
           line = (
-            f\"parser-api calls used: {api} (search={search}, details={details}, pdf={pdf}); \"\n+            f\"casesUpserted={processed}; pdf ok/empty/err={ok}/{empty}/{err}; \"\n+            f\"enrich ok/skip/err={enrich_ok}/{enrich_skip}/{enrich_err}\"\n+          )
+              f"parser-api calls used: {api} (search={search}, details={details}, pdf={pdf}); "
+              f"casesUpserted={processed}; pdf ok/empty/err={ok}/{empty}/{err}; "
+              f"enrich ok/skip/err={enrich_ok}/{enrich_skip}/{enrich_err}"
+          )
           print(line)
           summ = os.environ.get("GITHUB_STEP_SUMMARY")
           if summ:
-            with open(summ, "a", encoding="utf-8") as sf:
-              sf.write("### Parser-API budget\\n")
-              sf.write(line + "\\n")
+              with open(summ, "a", encoding="utf-8") as sf:
+                  sf.write("### Parser-API budget\\n")
+                  sf.write(line + "\\n")
           PY
