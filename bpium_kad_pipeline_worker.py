@@ -1019,7 +1019,19 @@ def main() -> int:
                     sort_field="id",
                     sort_type="-1",
                     fields_json=json.dumps(
-                        [x for x in [f44_inn, f44_sync_enabled, f44_last_req_log, f44_search_from, f44_counterparty_name] if x]
+                        [
+                            x
+                            for x in [
+                                f44_inn,
+                                f44_sync_enabled,
+                                f44_last_req_log,
+                                f44_last_req_at,
+                                f44_last_sync_at,
+                                f44_search_from,
+                                f44_counterparty_name,
+                            ]
+                            if x
+                        ]
                     ),
                 )
                 if not page:
@@ -1036,6 +1048,23 @@ def main() -> int:
                     if len(track_records) >= int(args.max_tracks_per_run):
                         break
                 offset += page_size
+
+            # Fair scheduling under parser-api budget:
+            # process records that were never synced / synced long ago first.
+            def _track_sort_key(rec: Dict[str, Any]) -> Tuple[int, float, int]:
+                vals = as_dict(rec.get("values"))
+                d_req = parse_iso_utc(str(get_value(vals, f44_last_req_at) or ""))
+                d_sync = parse_iso_utc(str(get_value(vals, f44_last_sync_at) or ""))
+                d = d_req or d_sync
+                never = 0 if d is None else 1
+                ts = d.timestamp() if d is not None else 0.0
+                try:
+                    rid_num = int(str(rec.get("id") or rec.get("recordId") or "0"))
+                except Exception:
+                    rid_num = 0
+                return (never, ts, rid_num)
+
+            track_records = sorted(track_records, key=_track_sort_key)
 
         out_summary["tracks"]["scanned"] = tracks_scanned
 
