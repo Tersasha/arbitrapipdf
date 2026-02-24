@@ -26,9 +26,9 @@ def iso_utc_now() -> str:
 def redact_secrets(text: str) -> str:
     s = str(text or "")
     # Redact parser-api key query param
-    s = re.sub(r"([?&]key=)[^&#\\s]+", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    s = re.sub(r"([?&]key=)[^&#\\s]+", r"\1<redacted>", s, flags=re.IGNORECASE)
     # Redact auth header if it ever appears
-    s = re.sub(r"(Authorization\\s*:\\s*)([^\\r\\n]+)", r"\\1<redacted>", s, flags=re.IGNORECASE)
+    s = re.sub(r"(Authorization\\s*:\\s*)([^\\r\\n]+)", r"\1<redacted>", s, flags=re.IGNORECASE)
     return s
 
 
@@ -953,6 +953,7 @@ def main() -> int:
         "enrichOk": 0,
         "enrichSkip": 0,
         "enrichErr": 0,
+        "caseErr": 0,
         "dryRun": bool(args.dry_run),
         "updatedAt": iso_utc_now(),
     }
@@ -1318,7 +1319,20 @@ def main() -> int:
                         if per_track_cases_upserted >= int(args.max_cases_per_track):
                             break
                         if isinstance(c, dict):
-                            process_case(c, meta)
+                            try:
+                                process_case(c, meta)
+                            except Exception as exc:
+                                out_summary["caseErr"] += 1
+                                last_error = f"process_case(backfill) failed: {redact_secrets(str(exc))}"
+                                if args.debug:
+                                    out_summary.setdefault("caseErrors", []).append(
+                                        {
+                                            "mode": "backfill",
+                                            "trackRecordId": trid,
+                                            "caseId": str(c.get("CaseId") or ""),
+                                            "error": redact_secrets(str(exc)),
+                                        }
+                                    )
 
                     if api_calls_total >= int(args.max_parser_api_calls) or per_track_cases_upserted >= int(args.max_cases_per_track):
                         break
@@ -1377,7 +1391,20 @@ def main() -> int:
                         if per_track_cases_upserted >= int(args.max_cases_per_track):
                             break
                         if isinstance(c, dict):
-                            process_case(c, meta)
+                            try:
+                                process_case(c, meta)
+                            except Exception as exc:
+                                out_summary["caseErr"] += 1
+                                last_error = f"process_case(rolling) failed: {redact_secrets(str(exc))}"
+                                if args.debug:
+                                    out_summary.setdefault("caseErrors", []).append(
+                                        {
+                                            "mode": "rolling",
+                                            "trackRecordId": trid,
+                                            "caseId": str(c.get("CaseId") or ""),
+                                            "error": redact_secrets(str(exc)),
+                                        }
+                                    )
 
                 cursor["mode"] = "rolling"
                 cursor["rolling"]["months"] = rolling_months
