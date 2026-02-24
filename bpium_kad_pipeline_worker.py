@@ -1352,10 +1352,13 @@ def main() -> int:
                         break
 
                     meta = {"mode": "backfill", "page": page, "dateFrom": date_from_backfill, "pagesCount": pages_count}
+                    page_interrupted = False
                     for c in cases:
                         if api_calls_total >= int(args.max_parser_api_calls):
+                            page_interrupted = True
                             break
                         if per_track_cases_upserted >= int(args.max_cases_per_track):
+                            page_interrupted = True
                             break
                         if isinstance(c, dict):
                             try:
@@ -1373,11 +1376,17 @@ def main() -> int:
                                         }
                                     )
 
+                    # Advance backfill page only when the whole page was processed.
+                    # If interrupted in the middle (budget/limit), keep current page.
+                    if not page_interrupted:
+                        page += 1
+                        cursor["backfill"]["page"] = page
+                    else:
+                        cursor["backfill"]["page"] = page
+
                     if api_calls_total >= int(args.max_parser_api_calls) or per_track_cases_upserted >= int(args.max_cases_per_track):
                         break
 
-                    page += 1
-                    cursor["backfill"]["page"] = page
                     if pages_count and page > pages_count:
                         backfill_done = True
                         cursor["mode"] = "rolling"
