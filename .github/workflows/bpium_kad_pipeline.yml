@@ -31,8 +31,6 @@ on:
         description: "Verbose output (true/false)"
         required: true
         default: "false"
-  schedule:
-    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
