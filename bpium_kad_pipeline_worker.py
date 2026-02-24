@@ -1050,10 +1050,10 @@ def main() -> int:
                     # Auto mode cooldown: do not re-check same INN too frequently.
                     # Manual mode (track_record_id) bypasses this guard intentionally.
                     if track_cooldown_hours > 0:
+                        # Cooldown must be based on LastReqAt only.
+                        # LastSyncAt may be touched by manual edits/migrations and can cause false skips.
                         d_req = parse_iso_utc(str(get_value(vals, f44_last_req_at) or ""))
-                        d_sync = parse_iso_utc(str(get_value(vals, f44_last_sync_at) or ""))
-                        d_last = d_req or d_sync
-                        if d_last is not None and d_last >= cutoff_dt:
+                        if d_req is not None and d_req >= cutoff_dt:
                             out_summary["tracksSkippedCooldown"] += 1
                             continue
                     track_records.append(rec)
@@ -1062,14 +1062,12 @@ def main() -> int:
                 offset += page_size
 
             # Fair scheduling under parser-api budget:
-            # process records that were never synced / synced long ago first.
+            # process records that were never requested / requested long ago first.
             def _track_sort_key(rec: Dict[str, Any]) -> Tuple[int, float, int]:
                 vals = as_dict(rec.get("values"))
                 d_req = parse_iso_utc(str(get_value(vals, f44_last_req_at) or ""))
-                d_sync = parse_iso_utc(str(get_value(vals, f44_last_sync_at) or ""))
-                d = d_req or d_sync
-                never = 0 if d is None else 1
-                ts = d.timestamp() if d is not None else 0.0
+                never = 0 if d_req is None else 1
+                ts = d_req.timestamp() if d_req is not None else 0.0
                 try:
                     rid_num = int(str(rec.get("id") or rec.get("recordId") or "0"))
                 except Exception:
