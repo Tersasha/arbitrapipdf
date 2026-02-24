@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -928,6 +928,7 @@ def main() -> int:
     source = os.getenv("PIPELINE_SOURCE") or "parser-api/kad"
     rolling_months = int(os.getenv("PIPELINE_ROLLING_MONTHS") or "6")
     rolling_max_pages = int(args.rolling_max_pages)
+    track_cooldown_hours = int(os.getenv("PIPELINE_TRACK_COOLDOWN_HOURS") or "24")
 
     headers = {
         "Authorization": build_auth_header(login, password),
@@ -943,6 +944,7 @@ def main() -> int:
         "ok": True,
         "mode": "pipeline",
         "tracks": {"scanned": 0, "processed": 0},
+        "tracksSkippedCooldown": 0,
         "apiCalls": 0,
         "detailsCalls": 0,
         "pdfCalls": 0,
@@ -1008,6 +1010,7 @@ def main() -> int:
         else:
             offset = 0
             page_size = 200
+            cutoff_dt = datetime.now(timezone.utc) - timedelta(hours=max(0, track_cooldown_hours))
             while len(track_records) < int(args.max_tracks_per_run):
                 page = bpium_list_records(
                     s,
@@ -1044,6 +1047,15 @@ def main() -> int:
                     inn = digits_only(str(get_value(vals, f44_inn) or ""))
                     if len(inn) not in (10, 12):
                         continue
+                    # Auto mode cooldown: do not re-check same INN too frequently.
+                    # Manual mode (track_record_id) bypasses this guard intentionally.
+                    if track_cooldown_hours > 0:
+                        d_req = parse_iso_utc(str(get_value(vals, f44_last_req_at) or ""))
+                        d_sync = parse_iso_utc(str(get_value(vals, f44_last_sync_at) or ""))
+                        d_last = d_req or d_sync
+                        if d_last is not None and d_last >= cutoff_dt:
+                            out_summary["tracksSkippedCooldown"] += 1
+                            continue
                     track_records.append(rec)
                     if len(track_records) >= int(args.max_tracks_per_run):
                         break
