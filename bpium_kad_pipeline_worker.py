@@ -812,6 +812,7 @@ def upsert_case_to_catalog_45(
     case: Dict[str, Any],
     source: str,
     search_meta: Dict[str, Any],
+    counterparty_name: str,
     dry_run: bool,
 ) -> Dict[str, Any]:
     fid_inn = fields_45["inn"]
@@ -823,6 +824,7 @@ def upsert_case_to_catalog_45(
     fid_source = fields_45["source"]
     fid_search_json = fields_45["search_json"]
     fid_case_type = fields_45["case_type"]
+    fid_counterparty_name = fields_45.get("counterparty_name") or ""
 
     case_id = str(case.get("CaseId") or "").strip()
     rec = find_results_record_by_case_id(session, base_url, headers, catalog_45, fid_case_id, case_id)
@@ -837,6 +839,8 @@ def upsert_case_to_catalog_45(
         str(fid_source): source,
         str(fid_search_json): json.dumps({"meta": search_meta, "case": case}, ensure_ascii=False),
     }
+    if fid_counterparty_name and str(counterparty_name or "").strip():
+        desired[str(fid_counterparty_name)] = str(counterparty_name or "").strip()
 
     if rec is None:
         desired[str(fid_created_at)] = iso_utc_now()
@@ -898,6 +902,7 @@ def main() -> int:
     f44_last_req_log = os.getenv("BPIUM_44_LAST_REQ_LOG") or "11"
     f44_last_req_at = os.getenv("BPIUM_44_LAST_REQ_AT") or "12"
     f44_search_from = os.getenv("BPIUM_44_SEARCH_FROM") or "22"
+    f44_counterparty_name = os.getenv("BPIUM_44_COUNTERPARTY_NAME") or ""
 
     # Catalog 45 fields
     fields_45 = {
@@ -913,6 +918,7 @@ def main() -> int:
         "search_json": os.getenv("BPIUM_45_SEARCH_JSON") or "12",
         "details_json": os.getenv("BPIUM_45_DETAILS_JSON") or "13",
         "case_type": os.getenv("BPIUM_45_CASE_TYPE") or "14",
+        "counterparty_name": os.getenv("BPIUM_45_COUNTERPARTY_NAME") or "",
         "pdf_text": os.getenv("BPIUM_45_PDF_TEXT") or "19",
         "pdf_text_fetched_at": os.getenv("BPIUM_45_PDF_TEXT_FETCHED_AT") or "20",
         "pdf_text_status": os.getenv("BPIUM_45_PDF_TEXT_STATUS") or "21",
@@ -952,8 +958,21 @@ def main() -> int:
     }
 
     with requests.Session() as s:
+        # Resolve optional field ids by name when env ids are not provided.
+        cat44_name_to_id = bpium_get_catalog_fields_map(s, domain, headers, cat_44)
+        if not f44_counterparty_name:
+            for n in ("CounterpartyName", "Название контрагента"):
+                if n in cat44_name_to_id:
+                    f44_counterparty_name = cat44_name_to_id[n]
+                    break
+
         # Resolve enriched field ids by name. If fields are not added yet, enrichment is skipped silently.
         cat45_name_to_id = bpium_get_catalog_fields_map(s, domain, headers, cat_45)
+        if not fields_45.get("counterparty_name"):
+            for n in ("CounterpartyName", "Название контрагента"):
+                if n in cat45_name_to_id:
+                    fields_45["counterparty_name"] = cat45_name_to_id[n]
+                    break
         mvp_field_names = [
             "State",
             "Finished",
@@ -998,7 +1017,9 @@ def main() -> int:
                     offset=offset,
                     sort_field="id",
                     sort_type="-1",
-                    fields_json=json.dumps([f44_inn, f44_sync_enabled, f44_last_req_log, f44_search_from]),
+                    fields_json=json.dumps(
+                        [x for x in [f44_inn, f44_sync_enabled, f44_last_req_log, f44_search_from, f44_counterparty_name] if x]
+                    ),
                 )
                 if not page:
                     break
@@ -1027,6 +1048,11 @@ def main() -> int:
 
             inn_digits = digits_only(str(get_value(tvals, f44_inn) or ""))
             date_from_backfill = normalize_date_to_yyyy_mm_dd(get_value(tvals, f44_search_from))
+            counterparty_name = (
+                str(get_value(tvals, f44_counterparty_name) or "").strip()
+                if f44_counterparty_name
+                else ""
+            )
 
             per_track_api_calls = 0
             per_track_cases_upserted = 0
@@ -1100,6 +1126,7 @@ def main() -> int:
                     case=case_obj,
                     source=source,
                     search_meta=search_meta,
+                    counterparty_name=counterparty_name,
                     dry_run=bool(args.dry_run),
                 )
                 per_track_cases_upserted += 1
@@ -1396,6 +1423,7 @@ def main() -> int:
                     {
                         "trackRecordId": trid,
                         "inn": inn_digits,
+                        "counterpartyName": counterparty_name,
                         "mode": cursor.get("mode"),
                         "cursor": cursor,
                         "status": status,
