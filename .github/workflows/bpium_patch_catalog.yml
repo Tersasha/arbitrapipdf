@@ -11,6 +11,8 @@ on:
         description: "Preset to apply"
         required: true
         default: "results45_enrich_mvp"
+  schedule:
+    - cron: "0 0 * * 0"
 
 permissions:
   contents: read
@@ -46,7 +48,6 @@ jobs:
           BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
         run: |
           set -euo pipefail
-          CID="${{ github.event.inputs.catalog_id }}"
-          PRESET="${{ github.event.inputs.preset }}"
+          CID="${{ github.event.inputs.catalog_id || '45' }}"
+          PRESET="${{ github.event.inputs.preset || 'results45_enrich_mvp' }}"
           python bpium_patch_catalog_fields.py --domain "${BPIUM_DOMAIN}" --catalog-id "${CID}" --preset "${PRESET}"
-

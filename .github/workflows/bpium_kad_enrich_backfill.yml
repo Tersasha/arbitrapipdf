@@ -6,11 +6,11 @@ on:
       max_records_per_run:
         description: "Max records (catalog 45) to process per run"
         required: true
-        default: "200"
+        default: "5000"
       page_size:
         description: "Bpium page size when scanning catalog 45"
         required: true
-        default: "100"
+        default: "200"
       dry_run:
         description: "Do not write to Bpium (true/false)"
         required: true
@@ -23,6 +23,8 @@ on:
         description: "Overwrite already filled fields (true/false)"
         required: true
         default: "false"
+  schedule:
+    - cron: "0 1 * * 0"
 
 permissions:
   contents: read
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   backfill:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -59,8 +61,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAX_REC="${{ github.event.inputs.max_records_per_run || '200' }}"
-          PAGE_SIZE="${{ github.event.inputs.page_size || '100' }}"
+          MAX_REC="${{ github.event.inputs.max_records_per_run || '5000' }}"
+          PAGE_SIZE="${{ github.event.inputs.page_size || '200' }}"
           DRY="${{ github.event.inputs.dry_run || 'false' }}"
           DEBUG="${{ github.event.inputs.debug || 'false' }}"
           FORCE="${{ github.event.inputs.force || 'false' }}"
@@ -71,4 +73,3 @@ jobs:
           if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
 
           python bpium_kad_enrich_backfill_worker.py "${ARGS[@]}"
-

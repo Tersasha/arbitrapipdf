@@ -6,11 +6,11 @@ on:
       max_updates:
         description: "Max records to update in catalog 45 per run"
         required: true
-        default: "200"
+        default: "5000"
       max_scan_45:
         description: "Max records to scan in catalog 45 per run"
         required: true
-        default: "5000"
+        default: "50000"
       dry_run:
         description: "Do not write to Bpium (true/false)"
         required: true
@@ -23,6 +23,8 @@ on:
         description: "Verbose output (true/false)"
         required: true
         default: "false"
+  schedule:
+    - cron: "0 2 * * 0"
 
 permissions:
   contents: read
@@ -34,7 +36,7 @@ concurrency:
 jobs:
   backfill:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -61,8 +63,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAX_UPD="${{ github.event.inputs.max_updates || '200' }}"
-          MAX_SCAN_45="${{ github.event.inputs.max_scan_45 || '5000' }}"
+          MAX_UPD="${{ github.event.inputs.max_updates || '5000' }}"
+          MAX_SCAN_45="${{ github.event.inputs.max_scan_45 || '50000' }}"
           DRY="${{ github.event.inputs.dry_run || 'false' }}"
           FORCE="${{ github.event.inputs.force || 'false' }}"
           DEBUG="${{ github.event.inputs.debug || 'false' }}"
@@ -73,4 +75,3 @@ jobs:
           if [ "$DEBUG" = "true" ]; then ARGS+=(--debug); fi
 
           python bpium_counterparty_backfill_worker.py "${ARGS[@]}"
-
