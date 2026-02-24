@@ -10,11 +10,11 @@ on:
       max_tracks_per_run:
         description: "Max tracking records (catalog 44) per run"
         required: true
-        default: "1"
+        default: "100"
       max_parser_api_calls:
         description: "Max parser-api calls per run (budget)"
         required: true
-        default: "15"
+        default: "50"
       max_cases_per_track:
         description: "Max cases to upsert per tracking record"
         required: true
@@ -31,7 +31,8 @@ on:
         description: "Verbose output (true/false)"
         required: true
         default: "false"
-  # NOTE: schedule disabled (manual runs only)
+  schedule:
+    - cron: "*/20 * * * *"
 
 permissions:
   contents: read
@@ -81,8 +82,8 @@ jobs:
           DEBUG="${{ github.event.inputs.debug || '' }}"
 
           # Defaults for schedule-trigger runs
-          if [ -z "$MAX_TRACKS" ]; then MAX_TRACKS="1"; fi
-          if [ -z "$MAX_CALLS" ]; then MAX_CALLS="15"; fi
+          if [ -z "$MAX_TRACKS" ]; then MAX_TRACKS="100"; fi
+          if [ -z "$MAX_CALLS" ]; then MAX_CALLS="50"; fi
           if [ -z "$MAX_CASES" ]; then MAX_CASES="50"; fi
           if [ -z "$ROLL_PAGES" ]; then ROLL_PAGES="3"; fi
           if [ -z "$DRY" ]; then DRY="false"; fi
