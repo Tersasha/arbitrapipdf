@@ -1,0 +1,76 @@
+name: Bpium CounterpartyName Backfill (44 -> 45)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_updates:
+        description: "Max records to update in catalog 45 per run"
+        required: true
+        default: "200"
+      max_scan_45:
+        description: "Max records to scan in catalog 45 per run"
+        required: true
+        default: "5000"
+      dry_run:
+        description: "Do not write to Bpium (true/false)"
+        required: true
+        default: "false"
+      force:
+        description: "Overwrite non-empty target values (true/false)"
+        required: true
+        default: "false"
+      debug:
+        description: "Verbose output (true/false)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bpium-counterparty-backfill
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run counterparty backfill
+        shell: bash
+        env:
+          BPIUM_DOMAIN: ${{ secrets.BPIUM_DOMAIN }}
+          BPIUM_LOGIN: ${{ secrets.BPIUM_LOGIN }}
+          BPIUM_PASSWORD: ${{ secrets.BPIUM_PASSWORD }}
+          BPIUM_44_COUNTERPARTY_NAME: ${{ secrets.BPIUM_44_COUNTERPARTY_NAME }}
+          BPIUM_45_COUNTERPARTY_NAME: ${{ secrets.BPIUM_45_COUNTERPARTY_NAME }}
+        run: |
+          set -euo pipefail
+
+          MAX_UPD="${{ github.event.inputs.max_updates || '200' }}"
+          MAX_SCAN_45="${{ github.event.inputs.max_scan_45 || '5000' }}"
+          DRY="${{ github.event.inputs.dry_run || 'false' }}"
+          FORCE="${{ github.event.inputs.force || 'false' }}"
+          DEBUG="${{ github.event.inputs.debug || 'false' }}"
+
+          ARGS=(--max-updates "$MAX_UPD" --max-scan-45 "$MAX_SCAN_45")
+          if [ "$DRY" = "true" ]; then ARGS+=(--dry-run); fi
+          if [ "$FORCE" = "true" ]; then ARGS+=(--force); fi
+          if [ "$DEBUG" = "true" ]; then ARGS+=(--debug); fi
+
+          python bpium_counterparty_backfill_worker.py "${ARGS[@]}"
+
